@@ -1,0 +1,13 @@
+{
+    "editor.fontSize": 14,
+    "debug.console.fontSize": 14,
+    "scm.inputFontSize": 14,
+    "terminal.integrated.fontSize": 14,
+    "chat.editor.fontSize": 14,
+    "chat.fontSize": 14,
+    "markdown.preview.fontSize": 14,
+    "telegramClaude.botToken": "8429204359:AAG2y8fg5z2Cyhim7xtUYeCADHfiLl6juj4",
+    "telegramClaude.allowedChatIds": [5741154455],
+    "telegramClaude.autoStart": true,
+    "telegramClaude.enableClaudeIntegration": true
+}

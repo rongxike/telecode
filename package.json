@@ -1,0 +1,87 @@
+{
+  "name": "vscode-telegram-claude",
+  "displayName": "Telegram Claude Bridge",
+  "description": "VS Code extension to communicate with Claude through Telegram",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "telegram-claude.sendMessage",
+        "title": "Telegram: Send Message"
+      },
+      {
+        "command": "telegram-claude.configure",
+        "title": "Telegram: Configure Bot Token"
+      },
+      {
+        "command": "telegram-claude.startBot",
+        "title": "Telegram: Start Bot"
+      },
+      {
+        "command": "telegram-claude.stopBot",
+        "title": "Telegram: Stop Bot"
+      },
+      {
+        "command": "telegram-claude.clearConversation",
+        "title": "Telegram: Clear Conversation History"
+      },
+      {
+        "command": "telegram-claude.testSendToActiveChat",
+        "title": "Telegram: Test Send to Active Chat"
+      }
+    ],
+    "configuration": {
+      "title": "Telegram Claude",
+      "properties": {
+        "telegramClaude.botToken": {
+          "type": "string",
+          "default": "",
+          "description": "Telegram Bot API Token"
+        },
+        "telegramClaude.allowedChatIds": {
+          "type": "array",
+          "default": [],
+          "description": "Allowed Telegram Chat IDs (for security)"
+        },
+        "telegramClaude.autoStart": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically start bot on VS Code startup"
+        },
+        "telegramClaude.enableClaudeIntegration": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable automatic Claude responses via VS Code Language Model API"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.x",
+    "@types/node-telegram-bot-api": "^0.64.12",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^6.x",
+    "@typescript-eslint/parser": "^6.x",
+    "eslint": "^8.x",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "node-telegram-bot-api": "^0.66.0"
+  }
+}
