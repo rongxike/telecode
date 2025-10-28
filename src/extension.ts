@@ -14,10 +14,10 @@ export interface TelegramAPI {
 }
 
 export function activate(context: vscode.ExtensionContext): TelegramAPI {
-    console.log('Telegram Claude Bridge is now active');
+    console.log('TeleCode is now active');
 
     extensionContext = context;
-    outputChannel = vscode.window.createOutputChannel('Telegram Claude');
+    outputChannel = vscode.window.createOutputChannel('TeleCode');
     context.subscriptions.push(outputChannel);
 
     // Restore active chat from previous session
@@ -28,28 +28,28 @@ export function activate(context: vscode.ExtensionContext): TelegramAPI {
 
     // Register commands
     context.subscriptions.push(
-        vscode.commands.registerCommand('telegram-claude.configure', configureBotToken)
+        vscode.commands.registerCommand('telecode.configure', configureBotToken)
     );
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('telegram-claude.startBot', startBot)
+        vscode.commands.registerCommand('telecode.startBot', startBot)
     );
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('telegram-claude.stopBot', stopBot)
+        vscode.commands.registerCommand('telecode.stopBot', stopBot)
     );
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('telegram-claude.sendMessage', sendMessage)
+        vscode.commands.registerCommand('telecode.sendMessage', sendMessage)
     );
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('telegram-claude.clearConversation', clearConversation)
+        vscode.commands.registerCommand('telecode.clearConversation', clearConversation)
     );
 
-    // Register command for sending to active Telegram chat (for Claude/other extensions to use)
+    // Register command for sending to active Telegram chat (for AI/other extensions to use)
     context.subscriptions.push(
-        vscode.commands.registerCommand('telegram-claude.sendToActiveChat', async (message: string) => {
+        vscode.commands.registerCommand('telecode.sendToActiveChat', async (message: string) => {
             if (!bot || !activeTelegramChat) {
                 vscode.window.showErrorMessage('No active Telegram conversation');
                 return false;
@@ -67,7 +67,7 @@ export function activate(context: vscode.ExtensionContext): TelegramAPI {
 
     // Test command with UI
     context.subscriptions.push(
-        vscode.commands.registerCommand('telegram-claude.testSendToActiveChat', async () => {
+        vscode.commands.registerCommand('telecode.testSend', async () => {
             if (!bot || !activeTelegramChat) {
                 vscode.window.showErrorMessage('No active Telegram conversation. Send a message from Telegram first!');
                 return;
@@ -80,14 +80,14 @@ export function activate(context: vscode.ExtensionContext): TelegramAPI {
             });
 
             if (message) {
-                await vscode.commands.executeCommand('telegram-claude.sendToActiveChat', message);
+                await vscode.commands.executeCommand('telecode.sendToActiveChat', message);
                 vscode.window.showInformationMessage('Message sent to Telegram!');
             }
         })
     );
 
     // Auto-start if configured
-    const config = vscode.workspace.getConfiguration('telegramClaude');
+    const config = vscode.workspace.getConfiguration('telecode');
     if (config.get<boolean>('autoStart')) {
         startBot();
     }
@@ -123,7 +123,7 @@ async function configureBotToken() {
     });
 
     if (token) {
-        const config = vscode.workspace.getConfiguration('telegramClaude');
+        const config = vscode.workspace.getConfiguration('telecode');
         await config.update('botToken', token, vscode.ConfigurationTarget.Global);
         vscode.window.showInformationMessage('Bot token configured successfully!');
     }
@@ -135,7 +135,7 @@ async function startBot() {
         return;
     }
 
-    const config = vscode.workspace.getConfiguration('telegramClaude');
+    const config = vscode.workspace.getConfiguration('telecode');
     const token = config.get<string>('botToken');
 
     if (!token) {
@@ -186,7 +186,7 @@ async function handleIncomingMessage(msg: TelegramBot.Message) {
     const username = msg.from?.username || msg.from?.first_name || 'Unknown';
 
     // Check if chat ID is allowed
-    const config = vscode.workspace.getConfiguration('telegramClaude');
+    const config = vscode.workspace.getConfiguration('telecode');
     const allowedChatIds = config.get<number[]>('allowedChatIds') || [];
 
     outputChannel.appendLine(`Message from ${username} (${chatId}): ${text}`);
@@ -195,7 +195,7 @@ async function handleIncomingMessage(msg: TelegramBot.Message) {
     if (text === '/start') {
         await bot.sendMessage(
             chatId,
-            `Welcome to VS Code Telegram Bridge!\n\nYour Chat ID: ${chatId}\n\nAdd this ID to your VS Code settings under 'telegramClaude.allowedChatIds' to enable communication.`
+            `Welcome to VS Code Telegram Bridge!\n\nYour Chat ID: ${chatId}\n\nAdd this ID to your VS Code settings under 'telecode.allowedChatIds' to enable communication.`
         );
         return;
     }
@@ -221,10 +221,10 @@ async function handleIncomingMessage(msg: TelegramBot.Message) {
         return;
     }
 
-    // Check if Claude integration is enabled
-    const enableClaude = config.get<boolean>('enableClaudeIntegration');
+    // Check if AI integration is enabled
+    const enableAI = config.get<boolean>('enableAIIntegration');
 
-    if (enableClaude) {
+    if (enableAI) {
         // Set active chat context and persist it
         activeTelegramChat = chatId;
         await extensionContext.globalState.update('activeTelegramChat', chatId);
@@ -284,7 +284,7 @@ async function sendMessage() {
         return;
     }
 
-    const config = vscode.workspace.getConfiguration('telegramClaude');
+    const config = vscode.workspace.getConfiguration('telecode');
     const allowedChatIds = config.get<number[]>('allowedChatIds') || [];
 
     if (allowedChatIds.length === 0) {

@@ -6,8 +6,8 @@
     "chat.editor.fontSize": 14,
     "chat.fontSize": 14,
     "markdown.preview.fontSize": 14,
-    "telegramClaude.botToken": "8429204359:AAG2y8fg5z2Cyhim7xtUYeCADHfiLl6juj4",
-    "telegramClaude.allowedChatIds": [5741154455],
-    "telegramClaude.autoStart": true,
-    "telegramClaude.enableClaudeIntegration": true
+    "telecode.botToken": "8429204359:AAG2y8fg5z2Cyhim7xtUYeCADHfiLl6juj4",
+    "telecode.allowedChatIds": [5741154455],
+    "telecode.autoStart": true,
+    "telecode.enableAIIntegration": true
 }

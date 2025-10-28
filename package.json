@@ -1,8 +1,8 @@
 {
-  "name": "vscode-telegram-claude",
-  "displayName": "Telegram Claude Bridge",
-  "description": "VS Code extension to communicate with Claude through Telegram",
-  "version": "0.0.1",
+  "name": "telecode",
+  "displayName": "TeleCode",
+  "description": "Bridge VS Code and Telegram - control your IDE from anywhere",
+  "version": "0.1.0",
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -16,52 +16,56 @@
   "contributes": {
     "commands": [
       {
-        "command": "telegram-claude.sendMessage",
-        "title": "Telegram: Send Message"
+        "command": "telecode.sendMessage",
+        "title": "TeleCode: Send Message"
       },
       {
-        "command": "telegram-claude.configure",
-        "title": "Telegram: Configure Bot Token"
+        "command": "telecode.configure",
+        "title": "TeleCode: Configure Bot Token"
       },
       {
-        "command": "telegram-claude.startBot",
-        "title": "Telegram: Start Bot"
+        "command": "telecode.startBot",
+        "title": "TeleCode: Start Bot"
       },
       {
-        "command": "telegram-claude.stopBot",
-        "title": "Telegram: Stop Bot"
+        "command": "telecode.stopBot",
+        "title": "TeleCode: Stop Bot"
       },
       {
-        "command": "telegram-claude.clearConversation",
-        "title": "Telegram: Clear Conversation History"
+        "command": "telecode.clearConversation",
+        "title": "TeleCode: Clear Conversation History"
       },
       {
-        "command": "telegram-claude.testSendToActiveChat",
-        "title": "Telegram: Test Send to Active Chat"
+        "command": "telecode.sendToActiveChat",
+        "title": "TeleCode: Send to Active Chat"
+      },
+      {
+        "command": "telecode.testSend",
+        "title": "TeleCode: Test Send"
       }
     ],
     "configuration": {
-      "title": "Telegram Claude",
+      "title": "TeleCode",
       "properties": {
-        "telegramClaude.botToken": {
+        "telecode.botToken": {
           "type": "string",
           "default": "",
           "description": "Telegram Bot API Token"
         },
-        "telegramClaude.allowedChatIds": {
+        "telecode.allowedChatIds": {
           "type": "array",
           "default": [],
           "description": "Allowed Telegram Chat IDs (for security)"
         },
-        "telegramClaude.autoStart": {
+        "telecode.autoStart": {
           "type": "boolean",
           "default": false,
           "description": "Automatically start bot on VS Code startup"
         },
-        "telegramClaude.enableClaudeIntegration": {
+        "telecode.enableAIIntegration": {
           "type": "boolean",
           "default": true,
-          "description": "Enable automatic Claude responses via VS Code Language Model API"
+          "description": "Enable automatic AI responses via VS Code Language Model API"
         }
       }
     }
