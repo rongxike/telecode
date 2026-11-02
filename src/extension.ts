@@ -286,18 +286,86 @@ async function stopBot() {
     vscode.window.showInformationMessage('Telegram bot stopped.');
 }
 
+interface IncomingImage {
+    mimeType: string;
+    data: Uint8Array;
+}
+
+/** Telegram rejects bot downloads above 20 MB; keep a safety margin. */
+const MAX_INCOMING_IMAGE_BYTES = 8 * 1024 * 1024;
+
+/** Photos arrive as several sizes; documents only count when they are images. */
+function incomingImageRefs(msg: Message): Array<{ fileId: string; mimeType: string }> {
+    const refs: Array<{ fileId: string; mimeType: string }> = [];
+
+    const photos = msg.photo;
+    if (photos && photos.length > 0) {
+        const largest = photos[photos.length - 1];
+        refs.push({ fileId: largest.file_id, mimeType: 'image/jpeg' });
+    }
+
+    const document = msg.document;
+    const documentMime = document?.mime_type || '';
+    if (document && documentMime.startsWith('image/')) {
+        refs.push({ fileId: document.file_id, mimeType: documentMime });
+    }
+
+    return refs;
+}
+
+async function downloadIncomingImages(msg: Message): Promise<IncomingImage[]> {
+    if (!bot) {
+        return [];
+    }
+
+    const refs = incomingImageRefs(msg).slice(0, 4);
+    const images: IncomingImage[] = [];
+
+    for (const ref of refs) {
+        try {
+            const link = await bot.getFileLink(ref.fileId);
+            const response = await fetch(link);
+
+            if (!response.ok) {
+                throw new Error(`download failed (HTTP ${response.status})`);
+            }
+
+            const buffer = Buffer.from(await response.arrayBuffer());
+            if (buffer.length === 0) {
+                throw new Error('file was empty');
+            }
+            if (buffer.length > MAX_INCOMING_IMAGE_BYTES) {
+                throw new Error(`file is too large (${Math.round(buffer.length / 1024 / 1024)} MB, limit ${MAX_INCOMING_IMAGE_BYTES / 1024 / 1024} MB)`);
+            }
+
+            outputChannel.appendLine(`Downloaded image ${ref.mimeType} (${Math.round(buffer.length / 1024)} KB)`);
+            images.push({ mimeType: ref.mimeType, data: new Uint8Array(buffer) });
+        } catch (error) {
+            const reason = error instanceof Error ? error.message : String(error);
+            outputChannel.appendLine(`Could not download image ${ref.fileId}: ${reason}`);
+            void bot.sendMessage(msg.chat.id, `⚠️ I could not download that image: ${reason}`).catch(() => undefined);
+        }
+    }
+
+    return images;
+}
+
 async function handleIncomingMessage(msg: Message) {
-    if (!bot) return;
+    if (!bot) {
+        return;
+    }
 
     const chatId = msg.chat.id;
-    const text = msg.text || '';
+    const text = msg.text || msg.caption || '';
+    const imageCount = incomingImageRefs(msg).length;
     const username = msg.from?.username || msg.from?.first_name || 'Unknown';
 
     // Check if chat ID is allowed
     const config = vscode.workspace.getConfiguration('telecode');
     const allowedChatIds = config.get<number[]>('allowedChatIds') || [];
 
-    outputChannel.appendLine(`Message from ${username} (${chatId}): ${text}`);
+    const attachmentNote = imageCount > 0 ? ` [+${imageCount} image${imageCount > 1 ? 's' : ''}]` : '';
+    outputChannel.appendLine(`Message from ${username} (${chatId}): ${text}${attachmentNote}`);
 
     // Handle /start command to show chat ID
     if (text.trim().toLowerCase() === '/start') {
@@ -368,8 +436,11 @@ async function handleIncomingMessage(msg: Message) {
         // Send "typing" action
         await bot.sendChatAction(chatId, 'typing');
 
+        // Download photos/documents so the model can actually see them.
+        const images = await downloadIncomingImages(msg);
+
         // Get response from Claude
-        const claudeResponse = await askClaude(chatId, text);
+        const claudeResponse = await askClaude(chatId, text, images);
 
         if (claudeResponse) {
             // Split long messages (Telegram has 4096 char limit)
@@ -395,8 +466,9 @@ async function handleIncomingMessage(msg: Message) {
         await deliverGeneratedMedia(chatId);
     } else {
         // Show notification in VS Code for manual reply
+        const preview = text || (imageCount > 0 ? '[image]' : '');
         const action = await vscode.window.showInformationMessage(
-            `📱 ${username}: ${text.substring(0, 50)}${text.length > 50 ? '...' : ''}`,
+            `📱 ${username}: ${preview.substring(0, 50)}${preview.length > 50 ? '...' : ''}`,
             'Reply',
             'View in Output'
         );
@@ -472,6 +544,7 @@ const HELP_TEXT = [
     '/start - show your chat ID',
     '',
     'Anything else goes to the selected model, which can read, search and edit this workspace and run commands.',
+    'Send a photo (or an image file) with an optional caption and I will look at it - as long as the selected model supports images.',
     'Memory is kept per chat and survives VS Code restarts; it compacts automatically when it grows too large.'
 ].join('\n');
 
@@ -976,7 +1049,9 @@ async function handleMediaCommand(chatId: number, text: string): Promise<void> {
     }
 }
 
-async function askClaude(chatId: number, userMessage: string): Promise<string | null> {
+async function askClaude(chatId: number, userMessage: string, images: IncomingImage[] = []): Promise<string | null> {
+    let activeModelLabel = 'the selected model';
+
     try {
         const available = await vscode.lm.selectChatModels();
 
@@ -991,7 +1066,8 @@ async function askClaude(chatId: number, userMessage: string): Promise<string | 
             return 'No language model available in VS Code. Make sure a Language Model provider is installed and signed in.';
         }
 
-        outputChannel.appendLine(`Using model: ${model.name || model.id} (${model.vendor}/${model.family})`);
+        activeModelLabel = `${model.name || model.id} (${model.vendor}/${model.family})`;
+        outputChannel.appendLine(`Using model: ${activeModelLabel}`);
 
         // Keep the transcript within limits before it is sent to the model.
         if (memory.needsCompaction(chatId)) {
@@ -1000,7 +1076,19 @@ async function askClaude(chatId: number, userMessage: string): Promise<string | 
 
         const summary = memory.getSummary(chatId);
         const stored = memory.getMessages(chatId);
-        const userMsg = vscode.LanguageModelChatMessage.User(userMessage);
+
+        const promptText = userMessage.trim() || (images.length > 0 ? 'Describe this image.' : userMessage);
+        const memoryText =
+            images.length > 0
+                ? `${promptText || '(image)'}\n[${images.length} image${images.length > 1 ? 's' : ''} attached: ${images.map((image) => image.mimeType).join(', ')}]`
+                : userMessage;
+
+        const userMessageContent = images.length > 0
+            ? vscode.LanguageModelChatMessage.User([
+                new vscode.LanguageModelTextPart(promptText || '(image)'),
+                ...images.map((image) => vscode.LanguageModelDataPart.image(image.data, image.mimeType))
+            ])
+            : vscode.LanguageModelChatMessage.User(userMessage);
 
         const tools = collectChatTools();
         outputChannel.appendLine(`Tools available: ${tools.length}${tools.length ? ` (${tools.slice(0, 8).map((t) => t.name).join(', ')}${tools.length > 8 ? ', ...' : ''})` : ''}`);
@@ -1011,7 +1099,7 @@ async function askClaude(chatId: number, userMessage: string): Promise<string | 
                 ? [vscode.LanguageModelChatMessage.User(`Summary of the earlier conversation:\n${summary}`)]
                 : []),
             ...stored.map(toChatMessage),
-            userMsg
+            userMessageContent
         ];
 
         const tokenSource = new vscode.CancellationTokenSource();
@@ -1050,7 +1138,7 @@ async function askClaude(chatId: number, userMessage: string): Promise<string | 
                 );
 
                 if (toolCalls.length === 0) {
-                    await remember(chatId, userMessage, text);
+                    await remember(chatId, memoryText, text);
                     return text;
                 }
 
@@ -1109,7 +1197,7 @@ async function askClaude(chatId: number, userMessage: string): Promise<string | 
 
         // Tool budget exhausted: keep whatever the model said last.
         const fallback = lastText || 'Stopped after too many tool calls without a final answer.';
-        await remember(chatId, userMessage, fallback);
+        await remember(chatId, memoryText, fallback);
         return fallback;
     } catch (error) {
         if (error instanceof vscode.LanguageModelError) {
@@ -1120,6 +1208,17 @@ async function askClaude(chatId: number, userMessage: string): Promise<string | 
             } else if (error.code === vscode.LanguageModelError.NoPermissions.name) {
                 return 'No permission to use the selected model. Check your VS Code settings.';
             }
+        }
+
+        if (images.length > 0) {
+            const reason = error instanceof Error ? error.message : String(error);
+            const looksLikeModality =
+                /image|vision|modalit|content|media|part|attachment|unsupported|not support/i.test(reason);
+
+            outputChannel.appendLine(`Image request failed: ${reason}`);
+            return looksLikeModality
+                ? `⚠️ ${activeModelLabel} cannot read images, so the picture never reached the model.\n\nUse /model to switch to a vision-capable model, then resend the image.`
+                : `⚠️ Could not process that image with ${activeModelLabel}: ${reason}`;
         }
 
         outputChannel.appendLine(`Chat error: ${error}`);

@@ -72,13 +72,19 @@ From Telegram:
 
 The model can also call `telecode_generate_image` and `telecode_generate_video` itself when you ask for a picture or clip in natural language; the generated file is delivered to the chat automatically.
 
+### Sending images to the bot
+
+Send a photo or an image file (JPEG/PNG/WebP/GIF) with an optional caption and TeleCode downloads it and attaches it to the request as an image part, so the model can actually look at it. A caption such as "what is wrong in this screenshot?" becomes the prompt; without a caption the bot asks the model to describe the image.
+
+Image support depends on the selected model. If the model has no vision capability, TeleCode replies that it cannot read images and suggests switching with `/model`. Files larger than 8 MB are rejected. The conversation memory keeps a short `[1 image attached: image/jpeg]` placeholder instead of the raw bytes, so history does not bloat.
+
 ### Memory
 
 Conversation memory is stored per chat in VS Code's extension state, so it survives window reloads and restarts. When a chat grows past 400 messages or roughly 200k tokens of text, TeleCode summarises the older turns into a running summary (keeping the most recent 40 messages verbatim) and every request carries that summary as context. Long transcripts are folded in chunks so nothing is dropped. Use `/compact` to do it on demand and `/clear` to forget everything.
 
 ### From Telegram
 
-Simply send any message to your bot! If AI integration is enabled, you'll get automatic responses from your configured Language Model.
+Simply send any message to your bot! If AI integration is enabled, you'll get automatic responses from your configured Language Model. You can also send photos or image files and ask questions about them (see [Sending images to the bot](#sending-images-to-the-bot)).
 
 ### From VS Code
 
