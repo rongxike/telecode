@@ -83,7 +83,7 @@ const telecode = telecodeExt?.exports;
 
 // Send message to active Telegram chat
 if (telecode?.isInTelegramContext()) {
-    await telecode.sendToActiveTelegramChat('Hello from my extension!');
+	await telecode.sendToActiveTelegramChat('Hello from my extension!');
 }
 
 // Or use command
@@ -126,7 +126,12 @@ npm run compile
 
 # Watch mode
 npm run watch
+
+# Bump patch version, package and install the extension user-wide
+npm run install:local
 ```
+
+`install:local` always bumps `version` first, so the new build shows up as an update in the Extensions view instead of silently replacing the old one.
 
 ## License
 

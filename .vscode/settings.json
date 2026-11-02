@@ -6,8 +6,6 @@
     "chat.editor.fontSize": 14,
     "chat.fontSize": 14,
     "markdown.preview.fontSize": 14,
-    "telecode.botToken": "bot_token",
-    "telecode.allowedChatIds": [5741154455],
     "telecode.autoStart": true,
     "telecode.enableAIIntegration": true
 }
