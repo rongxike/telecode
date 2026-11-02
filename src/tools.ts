@@ -19,6 +19,40 @@ const MAX_RESULT_CHARS = 12000;
 const MAX_SEARCH_MATCHES = 200;
 const MAX_SEARCH_FILE_BYTES = 1024 * 1024;
 
+/** A file a tool read or wrote, recorded so later turns do not have to read it again. */
+export interface TrackedFile {
+    path: string;
+    content: string;
+    mtimeMs: number;
+    kind: 'read' | 'written';
+}
+
+type FileTracker = (chatId: number, file: TrackedFile) => void;
+
+let fileTracker: FileTracker | null = null;
+
+/** Wiring hook: the extension points this at the chat's working-set memory. */
+export function setFileTracker(tracker: FileTracker | null): void {
+    fileTracker = tracker;
+}
+
+function trackFile(file: TrackedFile): void {
+    if (!fileTracker) {
+        return;
+    }
+
+    const chatId = getActiveChatId();
+    if (chatId === null) {
+        return;
+    }
+
+    try {
+        fileTracker(chatId, file);
+    } catch {
+        // Bookkeeping must never break a tool call.
+    }
+}
+
 function workspaceRoots(): string[] {
     return (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath);
 }
@@ -123,6 +157,9 @@ const readFileTool: vscode.LanguageModelTool<ReadFileInput> = {
         const requestedEnd = Math.floor(options.input.endLine ?? start + MAX_READ_LINES - 1);
         const end = Math.min(lines.length, Math.max(start, Math.min(requestedEnd, start + MAX_READ_LINES - 1)));
 
+        // Remember the whole file, not just the slice, so the next turn need not read it again.
+        trackFile({ path: relativeLabel(absolute), content: raw, mtimeMs: stat.mtimeMs, kind: 'read' });
+
         const body = lines
             .slice(start - 1, end)
             .map((line, index) => `${start + index}| ${line}`)
@@ -142,8 +179,15 @@ const writeFileTool: vscode.LanguageModelTool<WriteFileInput> = {
         await fs.mkdir(path.dirname(absolute), { recursive: true });
         await fs.writeFile(absolute, options.input.content, 'utf8');
 
+        const stats = await fs.stat(absolute);
         const bytes = Buffer.byteLength(options.input.content, 'utf8');
         const lines = options.input.content.split(/\r?\n/).length;
+        trackFile({
+            path: relativeLabel(absolute),
+            content: options.input.content,
+            mtimeMs: stats.mtimeMs,
+            kind: 'written'
+        });
         return textResult(`Wrote ${bytes} bytes (${lines} lines) to ${relativeLabel(absolute)}.`);
     }
 };
@@ -248,6 +292,9 @@ const editFileTool: vscode.LanguageModelTool<EditFileInput> = {
             ? original.split(input.oldText).join(input.newText)
             : original.replace(input.oldText, input.newText);
         await fs.writeFile(absolute, updated, 'utf8');
+
+        const stats = await fs.stat(absolute);
+        trackFile({ path: relativeLabel(absolute), content: updated, mtimeMs: stats.mtimeMs, kind: 'written' });
 
         return textResult(
             `Replaced ${input.replaceAll ? occurrences : 1} occurrence(s) in ${relativeLabel(absolute)} (${updated.length} chars now).`

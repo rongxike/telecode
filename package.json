@@ -2,7 +2,7 @@
 	"name": "telecode",
 	"displayName": "TeleCode",
 	"description": "Bridge VS Code and Telegram - control your IDE from anywhere",
-	"version": "0.1.13",
+	"version": "0.1.15",
 	"publisher": "local",
 	"license": "MIT",
 	"repository": {
@@ -85,6 +85,17 @@
 					"type": "string",
 					"default": "",
 					"markdownDescription": "Language model used for Telegram replies. Accepts a model `id` (e.g. `deepseek-v4-flash`), a `vendor/family` pair (e.g. `deepseek/deepseek`), or a `family` name. Leave empty to use the first available model. Run **TeleCode: Select AI Model** to pick one."
+				},
+				"telecode.memory.fileContextChars": {
+					"type": "number",
+					"default": 24000,
+					"minimum": 0,
+					"markdownDescription": "Characters of remembered file content attached to every request. TeleCode keeps the files it read or edited (up to 40 per chat) so the model does not read them again; lower this to save tokens, raise it to hold more code in context. `0` disables file memory injection."
+				},
+				"telecode.agent.autoTools": {
+					"type": "boolean",
+					"default": true,
+					"markdownDescription": "Only offer coding tools when a message looks like a workspace request (a file path, command, code, or a work verb such as fix/build/run). Conversational messages like \"where are we now?\" are then answered directly instead of triggering file reads and shell commands. Set to `false` to always offer tools."
 				},
 				"telecode.media.enabled": {
 					"type": "boolean",

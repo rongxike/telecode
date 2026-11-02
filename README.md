@@ -82,6 +82,19 @@ Image support depends on the selected model. If the model has no vision capabili
 
 Conversation memory is stored per chat in VS Code's extension state, so it survives window reloads and restarts. When a chat grows past 400 messages or roughly 200k tokens of text, TeleCode summarises the older turns into a running summary (keeping the most recent 40 messages verbatim) and every request carries that summary as context. Long transcripts are folded in chunks so nothing is dropped. Use `/compact` to do it on demand and `/clear` to forget everything.
 
+#### Working set (remembered files)
+
+`telecode_read_file`, `telecode_write_file` and `telecode_edit_file` record what they touched: the full file content (up to 40 KB per file, 40 files per chat) plus the modification time. Every following request carries that content, so the model does not have to read the same file again to answer the next question, and it is told which files it already has.
+
+A compact activity log is kept as well (the last 25 tool calls with a one-line detail such as `read(src/tools.ts) -> ok`), so the model knows what work is already done.
+
+- `/files` lists the remembered files with their age
+- `/forget` drops the remembered files and activity log but keeps the conversation
+- `/clear` drops everything for the chat
+- `telecode.memory.fileContextChars` (default `24000`, `0` disables) caps how much remembered content is attached to each request
+
+Files remembered this way live in extension state, not in your repository, and are capped by character count so the working set cannot grow without bound.
+
 ### From Telegram
 
 Simply send any message to your bot! If AI integration is enabled, you'll get automatic responses from your configured Language Model. You can also send photos or image files and ask questions about them (see [Sending images to the bot](#sending-images-to-the-bot)).
@@ -103,6 +116,15 @@ All settings are available under `telecode` in VS Code settings:
 - **`allowedChatIds`**: Array of allowed chat IDs (for security)
 - **`autoStart`**: Automatically start bot on VS Code startup
 - **`enableAIIntegration`**: Enable/disable automatic AI responses via Language Model API
+- **`modelId`**: Model used for replies (`/model` switches it)
+- **`memory.fileContextChars`**: Characters of remembered file content sent with each request
+- **`agent.autoTools`** (default `true`): Only offer coding tools when a message looks like a workspace request. Set to `false` to always offer them.
+
+### Tool use
+
+Tools are only offered when the message looks like actual workspace work — a file path, a command, a code fragment, or a verb such as _fix_, _build_, _run_ or _search_. Conversational turns ("where are we now?", "thanks", "what's next?") are answered straight from the conversation and the remembered working set, so a simple question no longer turns into `git status` + directory listings.
+
+When tools are used, the loop is bounded: a repeated identical tool call is skipped with a nudge, and after 6 tool rounds TeleCode makes one final call **without** tools so you always get an answer instead of silence.
 
 ## Features in Detail
 

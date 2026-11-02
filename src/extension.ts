@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import TelegramBot, { type Message } from 'node-telegram-bot-api';
-import { invokeTelecodeTool, registerTelecodeTools, telecodeTools } from './tools';
-import { ConversationMemory, type StoredMessage } from './memory';
+import { invokeTelecodeTool, registerTelecodeTools, setFileTracker, telecodeTools } from './tools';
+import { ConversationMemory, formatAge, type StoredMessage } from './memory';
 import {
     generateImage,
     generateVideo,
@@ -37,6 +37,14 @@ export function activate(context: vscode.ExtensionContext): TelegramAPI {
 
     // Tools the model can call while answering Telegram messages.
     registerTelecodeTools(context);
+
+    // Let telecode_read_file / write_file / edit_file feed the chat's working set, so
+    // later turns already know the file content instead of reading it again.
+    setFileTracker((chatId, file) => {
+        void memory.rememberFile(chatId, file).catch((error) =>
+            outputChannel.appendLine(`Could not remember ${file.path}: ${error}`)
+        );
+    });
 
     // Restore active chat from previous session
     activeTelegramChat = context.globalState.get<number>('activeTelegramChat') || null;
@@ -399,7 +407,7 @@ async function handleIncomingMessage(msg: Message) {
             await bot.sendMessage(chatId, 'No conversation history to clear.');
         } else {
             await memory.clear(chatId);
-            await bot.sendMessage(chatId, '✅ Conversation history and summary cleared!');
+            await bot.sendMessage(chatId, '✅ Conversation history, summary and remembered files cleared!');
             outputChannel.appendLine(`Cleared memory for chat ${chatId}`);
         }
         return;
@@ -412,6 +420,23 @@ async function handleIncomingMessage(msg: Message) {
 
     if (command === '/status') {
         await handleStatusCommand(chatId);
+        return;
+    }
+
+    if (command === '/files') {
+        await handleFilesCommand(chatId);
+        return;
+    }
+
+    if (command === '/forget') {
+        const before = memory.fileStats(chatId);
+        await memory.forgetFiles(chatId);
+        await bot.sendMessage(
+            chatId,
+            before.count === 0
+                ? 'Nothing to forget - no files are remembered.'
+                : `🧹 Forgot ${before.count} remembered file(s). The conversation itself is untouched.`
+        );
         return;
     }
 
@@ -540,12 +565,14 @@ const HELP_TEXT = [
     '/model - list the language models VS Code offers',
     '/model <number> - switch to that model',
     '/compact - fold older messages into a summary now',
+    '/files - list the files I already hold in memory',
+    '/forget - drop those remembered files (keeps the conversation)',
     '/clear - forget the conversation and its summary',
     '/start - show your chat ID',
     '',
     'Anything else goes to the selected model, which can read, search and edit this workspace and run commands.',
     'Send a photo (or an image file) with an optional caption and I will look at it - as long as the selected model supports images.',
-    'Memory is kept per chat and survives VS Code restarts; it compacts automatically when it grows too large.'
+    'Memory is kept per chat and survives VS Code restarts; it compacts automatically when it grows too large. Files I read or edit stay in memory too, so I do not read them twice.'
 ].join('\n');
 
 function toChatMessage(message: StoredMessage): vscode.LanguageModelChatMessage {
@@ -702,9 +729,44 @@ async function handleStatusCommand(chatId: number): Promise<void> {
     }
 
     lines.push(`Memory: ${stats.messages} messages, ${stats.chars} chars, ${stats.summaryChars} char summary`);
+    const files = memory.fileStats(chatId);
+    lines.push(`Files in working set: ${files.count} (${Math.round(files.chars / 1024)} KB of content)`);
     lines.push(`Bot: ${bot ? 'running' : 'stopped'}`);
 
     await bot.sendMessage(chatId, lines.join('\n'));
+}
+
+/** Telegram `/files` command: show the working set the model already has in context. */
+async function handleFilesCommand(chatId: number): Promise<void> {
+    if (!bot) {
+        return;
+    }
+
+    const files = memory.getFiles(chatId);
+    if (files.length === 0) {
+        await bot.sendMessage(
+            chatId,
+            'No files remembered yet. Every file I read or edit is kept and sent with the next request, so I do not read it twice.'
+        );
+        return;
+    }
+
+    const now = Date.now();
+    const lines = [...files]
+        .reverse()
+        .map((file) => {
+            const size = Math.max(1, Math.round(file.chars / 1024));
+            const partial = file.truncated ? ' (partial content kept)' : '';
+            return `• ${file.path} - ${file.kind}, ${size} KB, ${formatAge(now - file.at)}${partial}`;
+        });
+
+    const stats = memory.fileStats(chatId);
+    await bot.sendMessage(
+        chatId,
+        `🗂 Remembered files (${stats.count}, ~${Math.round(stats.chars / 1024)} KB of content):\n\n` +
+            `${lines.join('\n')}\n\n` +
+            'Their content travels with every request, so I will not read them again unless you tell me they changed. Use /forget to drop them.'
+    );
 }
 
 /** Telegram `/compact` command. */
@@ -919,8 +981,8 @@ const CHAT_ONLY_TOOL_PATTERN =
 /** Tools that failed at runtime because they cannot run outside the chat panel. */
 const ungrantedTools = new Set<string>();
 
-const MAX_TOOL_COUNT = 48;
-const MAX_TOOL_ROUNDS = 10;
+const MAX_TOOL_COUNT = 16;
+const MAX_TOOL_ROUNDS = 6;
 
 /**
  * Tools offered to the model: TeleCode's own tools first (always executable),
@@ -960,6 +1022,68 @@ function collectChatTools(): vscode.LanguageModelChatTool[] {
     ];
 }
 
+/** One-line summary of a tool call, stored in the chat's activity log. */
+function describeToolCall(call: vscode.LanguageModelToolCallPart): string {
+    const input = (call.input ?? {}) as Record<string, unknown>;
+    const pick = (key: string): string => {
+        const value = input[key];
+        return typeof value === 'string' ? value : '';
+    };
+
+    const raw =
+        pick('filePath') ||
+        pick('path') ||
+        pick('query') ||
+        pick('command') ||
+        pick('prompt') ||
+        JSON.stringify(input);
+
+    return raw.replace(/\s+/g, ' ').slice(0, 90);
+}
+
+/** Characters of remembered file content injected into each request. */
+function fileContextBudget(): number {
+    const configured = vscode.workspace.getConfiguration('telecode').get<number>('memory.fileContextChars');
+    if (typeof configured === 'number' && Number.isFinite(configured) && configured >= 0) {
+        return configured;
+    }
+    return 24000;
+}
+
+/** Words that mean the user wants something read, changed or run. */
+const WORK_REQUEST_PATTERN =
+    /\b(file|files|folder|folders|dir|dirs|directory|repo|repository|git|branch|commit|push|pull|diff|stash|code|source|function|class|method|module|import|test|tests|spec|build|compile|lint|error|errors|exception|stack|bug|fix|refactor|implement|rename|delete|remove|move|create|add|update|change|edit|write|read|open|search|find|grep|check|show|run|execute|install|upgrade|migrate|npm|npx|dotnet|python|node|package|dependency|config|settings|skill|extension|vsix|publish|release|readme|changelog|\.md|\.ts|\.js|\.py|\.json)/i;
+
+/** Short messages that are chat, not work. */
+const SMALLTALK_PATTERN =
+    /^(hi|hey|hello|yo|sup|thanks|thank you|thx|ok|okay|k|cool|nice|great|got it|sure|yes|no|yep|nope|lol|haha|good (morning|night|evening)|how are you)\b/i;
+
+/**
+ * Decide whether a message is worth offering tools for. Tool-happy models call
+ * tools on "where are we now?" if they are available, so conversational
+ * messages are answered directly from the conversation and working set.
+ */
+function looksLikeWorkRequest(text: string): boolean {
+    const trimmed = text.trim();
+
+    if (trimmed.length === 0) {
+        return false;
+    }
+    if (SMALLTALK_PATTERN.test(trimmed) && trimmed.length <= 40) {
+        return false;
+    }
+    // A path or a code fragment is an explicit request to look at files.
+    if (/`|(^|\s)[\w.-]+[\\/][\w.-]+/.test(trimmed)) {
+        return true;
+    }
+    if (WORK_REQUEST_PATTERN.test(trimmed)) {
+        return true;
+    }
+
+    // Longer messages usually carry intent that is worth inspecting the workspace for.
+    return trimmed.length > 300;
+}
+
 /** Tell the model it is running inside the workspace, so it uses tools instead of refusing. */
 function buildWorkspaceContext(): string {
     const folders = vscode.workspace.workspaceFolders?.map((f) => f.uri.fsPath) ?? [];
@@ -968,6 +1092,9 @@ function buildWorkspaceContext(): string {
         'You DO have access to the workspace and its repository through the provided tools: use them to inspect files, search, run commands and make edits.',
         'Never claim you cannot see the files or the repository without first calling the available tools. Prefer doing the work over telling the user to run commands themselves.',
         'Use telecode_run_command for shell work such as git add/commit/push, npm and dotnet. Use telecode_list_dir to browse, telecode_read_file to inspect, telecode_search to grep, and telecode_write_file to create or overwrite files.',
+        'Some files are already included in this request (see the working-set message). Use that content first and only call telecode_read_file for files that are missing or marked truncated.',
+        'Match the effort to the request. Chat, status questions and anything the conversation or working set already answers get a direct reply with no tool calls - do not explore the repository just to orient yourself.',
+        'Only call tools when you need information you do not already have. Read a file at most once per turn and stop calling tools as soon as you can answer.',
         'The copilot_* tools, run_in_terminal, read_file, create_file, apply_patch and the subagent tools require the chat panel and always fail here - do not call them.',
         'If a tool call fails, try one alternative tool. If that fails too, stop and report the exact error instead of retrying the same call.',
         'Keep replies short: they are delivered as Telegram messages.'
@@ -1076,6 +1203,9 @@ async function askClaude(chatId: number, userMessage: string, images: IncomingIm
 
         const summary = memory.getSummary(chatId);
         const stored = memory.getMessages(chatId);
+        const workingSet = [memory.buildActivityContext(chatId), memory.buildFileContext(chatId, fileContextBudget())]
+            .filter((part) => part.length > 0)
+            .join('\n\n');
 
         const promptText = userMessage.trim() || (images.length > 0 ? 'Describe this image.' : userMessage);
         const memoryText =
@@ -1090,11 +1220,19 @@ async function askClaude(chatId: number, userMessage: string, images: IncomingIm
             ])
             : vscode.LanguageModelChatMessage.User(userMessage);
 
-        const tools = collectChatTools();
-        outputChannel.appendLine(`Tools available: ${tools.length}${tools.length ? ` (${tools.slice(0, 8).map((t) => t.name).join(', ')}${tools.length > 8 ? ', ...' : ''})` : ''}`);
+        const autoTools = vscode.workspace.getConfiguration('telecode').get<boolean>('agent.autoTools') ?? true;
+        const useTools = !autoTools || looksLikeWorkRequest(promptText);
+        const tools = useTools ? collectChatTools() : [];
+
+        outputChannel.appendLine(
+            useTools
+                ? `Tools available: ${tools.length}${tools.length ? ` (${tools.slice(0, 8).map((t) => t.name).join(', ')}${tools.length > 8 ? ', ...' : ''})` : ''}`
+                : 'Conversational message: answering without tools.'
+        );
 
         const messages: vscode.LanguageModelChatMessage[] = [
             vscode.LanguageModelChatMessage.User(buildWorkspaceContext()),
+            ...(workingSet ? [vscode.LanguageModelChatMessage.User(workingSet)] : []),
             ...(summary
                 ? [vscode.LanguageModelChatMessage.User(`Summary of the earlier conversation:\n${summary}`)]
                 : []),
@@ -1104,6 +1242,7 @@ async function askClaude(chatId: number, userMessage: string, images: IncomingIm
 
         const tokenSource = new vscode.CancellationTokenSource();
         let lastText = '';
+        const seenCalls = new Map<string, number>();
 
         try {
             for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
@@ -1149,7 +1288,26 @@ async function askClaude(chatId: number, userMessage: string, images: IncomingIm
                     const safeInput = JSON.stringify(call.input ?? {}).slice(0, 300);
                     outputChannel.appendLine(`Tool call: ${call.name} ${safeInput}`);
 
+                    const signature = `${call.name}:${JSON.stringify(call.input ?? {})}`;
+                    const repeats = (seenCalls.get(signature) ?? 0) + 1;
+                    seenCalls.set(signature, repeats);
+
+                    if (repeats > 1) {
+                        outputChannel.appendLine(`Skipping repeated call to ${call.name}`);
+                        messages.push(
+                            vscode.LanguageModelChatMessage.User([
+                                new vscode.LanguageModelToolResultPart(call.callId, [
+                                    new vscode.LanguageModelTextPart(
+                                        'You already made this exact call earlier in this turn and the result is above. Do not repeat it - answer the user with what you have.'
+                                    )
+                                ])
+                            ])
+                        );
+                        continue;
+                    }
+
                     let resultPart: vscode.LanguageModelToolResultPart;
+                    let succeeded = true;
                     try {
                         // TeleCode's own tools run in-process; everything else goes through VS Code.
                         const native = call.name.startsWith('telecode_')
@@ -1167,6 +1325,7 @@ async function askClaude(chatId: number, userMessage: string, images: IncomingIm
                         resultPart = new vscode.LanguageModelToolResultPart(call.callId, result.content);
                     } catch (error) {
                         const message = error instanceof Error ? error.message : String(error);
+                        succeeded = false;
                         outputChannel.appendLine(`Tool ${call.name} failed: ${message}`);
 
                         const chatOnly = /_inputContext|Invalid stream|Missing patch text|Invocation context|is not set|not available|not supported/i.test(message);
@@ -1185,20 +1344,48 @@ async function askClaude(chatId: number, userMessage: string, images: IncomingIm
                     }
 
                     messages.push(vscode.LanguageModelChatMessage.User([resultPart]));
+
+                    memory.recordTool(chatId, {
+                        tool: call.name.replace(/^telecode_/, ''),
+                        detail: describeToolCall(call),
+                        ok: succeeded
+                    });
                 }
 
                 if (bot) {
                     await bot.sendChatAction(chatId, 'typing').catch(() => undefined);
                 }
             }
+
+            // Tool budget exhausted: ask once more with no tools so the user always gets an answer.
+            outputChannel.appendLine('Tool budget exhausted; requesting a final answer without tools.');
+            const finalResponse = await model.sendRequest(
+                [
+                    ...messages,
+                    vscode.LanguageModelChatMessage.User(
+                        'Stop calling tools. Answer the user now with what you already gathered, and say briefly what you could not check.'
+                    )
+                ],
+                { justification: 'Producing a final Telegram answer after the tool budget was spent.' },
+                tokenSource.token
+            );
+
+            let finalText = '';
+            for await (const part of finalResponse.stream) {
+                if (part instanceof vscode.LanguageModelTextPart) {
+                    finalText += part.value;
+                }
+            }
+
+            const answer =
+                finalText ||
+                lastText ||
+                'I used up my tool budget before answering. Ask again with a narrower question and I will finish.';
+            await remember(chatId, memoryText, answer);
+            return answer;
         } finally {
             tokenSource.dispose();
         }
-
-        // Tool budget exhausted: keep whatever the model said last.
-        const fallback = lastText || 'Stopped after too many tool calls without a final answer.';
-        await remember(chatId, memoryText, fallback);
-        return fallback;
     } catch (error) {
         if (error instanceof vscode.LanguageModelError) {
             outputChannel.appendLine(`Language Model error: ${error.message} (${error.code})`);
