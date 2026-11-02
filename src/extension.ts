@@ -584,6 +584,7 @@ const HELP_TEXT = [
     '',
     '/help - show this list',
     '/status - show model, media and memory info',
+    '/stop - cancel the reply that is running now',
     '/image <prompt> - generate an image and send it here',
     '/video <prompt> - generate a short video and send it here',
     '/model - list the language models VS Code offers',
@@ -755,6 +756,9 @@ async function handleStatusCommand(chatId: number): Promise<void> {
     lines.push(`Memory: ${stats.messages} messages, ${stats.chars} chars, ${stats.summaryChars} char summary`);
     const files = memory.fileStats(chatId);
     lines.push(`Files in working set: ${files.count} (${Math.round(files.chars / 1024)} KB of content)`);
+    const limits = agentLimits();
+    lines.push(`Agent budget: ${limits.steps} steps / ${limits.minutes} min per reply`);
+    lines.push(`Running now: ${activeRuns.has(chatId) ? 'yes (send /stop to cancel)' : 'no'}`);
     lines.push(`Bot: ${bot ? 'running' : 'stopped'}`);
 
     await bot.sendMessage(chatId, lines.join('\n'));
@@ -1238,10 +1242,10 @@ function buildWorkspaceContext(): string {
         'Work like an autonomous coding agent: think the problem through, state a short plan for anything larger than a single edit, then execute it step by step and verify each change by reading the file back or running a build/test instead of assuming it worked.',
         'You may take many steps in one turn. Keep going until the task is actually finished; do not stop mid-task to ask permission for steps you already described, and only ask the user when you are blocked or need a decision only they can make.',
         'If a command or test fails, diagnose it and change approach instead of repeating the same call.',
-        'Only call tools when you need information you do not already have. Read a file at most once per turn and stop calling tools as soon as you can answer.',
+        'Only call tools when you need information you do not already have, and never re-run a call whose result you already have in this conversation.',
         'The copilot_* tools, run_in_terminal, read_file, create_file, apply_patch and the subagent tools require the chat panel and always fail here - do not call them.',
         'If a tool call fails, try one alternative tool. If that fails too, stop and report the exact error instead of retrying the same call.',
-        'Keep replies short: they are delivered as Telegram messages.'
+        'Finish the work first, then summarise: the final message is delivered as a Telegram message, so keep it short and concrete.'
     ];
 
     lines.push(
@@ -1322,6 +1326,7 @@ async function handleMediaCommand(chatId: number, text: string): Promise<void> {
 
 async function askClaude(chatId: number, userMessage: string, images: IncomingImage[] = []): Promise<string | null> {
     let activeModelLabel = 'the selected model';
+    let currentRun: vscode.CancellationTokenSource | undefined;
 
     try {
         const available = await vscode.lm.selectChatModels();
@@ -1390,9 +1395,11 @@ async function askClaude(chatId: number, userMessage: string, images: IncomingIm
         const limits = agentLimits();
         const deadline = Date.now() + limits.minutes * 60_000;
         const tokenSource = new vscode.CancellationTokenSource();
+        currentRun = tokenSource;
         activeRuns.set(chatId, tokenSource);
         let lastText = '';
         const seenCalls = new Map<string, { preview: string; step: number }>();
+        let nudgedEmpty = false;
 
         try {
             for (let step = 0; step < limits.steps; step++) {
@@ -1407,14 +1414,25 @@ async function askClaude(chatId: number, userMessage: string, images: IncomingIm
                     pruneOldToolResults(messages, TOOL_KEEP_RESULTS);
                 }
 
-                const response = await model.sendRequest(
-                    messages,
-                    {
-                        tools: tools.length > 0 ? tools : undefined,
-                        justification: 'Answering a Telegram message from the workspace owner.'
-                    },
-                    tokenSource.token
-                );
+                const requestOptions = {
+                    tools: tools.length > 0 ? tools : undefined,
+                    justification: 'Answering a Telegram message from the workspace owner.'
+                };
+
+                let response: vscode.LanguageModelChatResponse;
+                try {
+                    response = await model.sendRequest(messages, requestOptions, tokenSource.token);
+                } catch (error) {
+                    if (tokenSource.token.isCancellationRequested) {
+                        throw error;
+                    }
+
+                    // Usually a context overflow: prune hard and retry once before giving up.
+                    const reason = error instanceof Error ? error.message : String(error);
+                    outputChannel.appendLine(`sendRequest failed at step ${step + 1}: ${reason}`);
+                    pruneOldToolResults(messages, 2);
+                    response = await model.sendRequest(messages, requestOptions, tokenSource.token);
+                }
 
                 const parts: (vscode.LanguageModelTextPart | vscode.LanguageModelToolCallPart)[] = [];
                 let text = '';
@@ -1438,6 +1456,18 @@ async function askClaude(chatId: number, userMessage: string, images: IncomingIm
                 );
 
                 if (toolCalls.length === 0) {
+                    // Some providers occasionally return an empty turn; ask once instead of ending with nothing.
+                    if (text.trim().length === 0 && !nudgedEmpty) {
+                        nudgedEmpty = true;
+                        outputChannel.appendLine('Model returned an empty reply; asking once more.');
+                        messages.push(
+                            vscode.LanguageModelChatMessage.User(
+                                'Your last reply was empty. Continue the task or answer the user now.'
+                            )
+                        );
+                        continue;
+                    }
+
                     // The model answered without tools. If it is asking for the workspace, give it tools and retry.
                     if (!useTools && NEEDS_WORKSPACE_PATTERN.test(text)) {
                         outputChannel.appendLine('Answer needed the workspace; retrying this turn with tools enabled.');
@@ -1571,7 +1601,7 @@ async function askClaude(chatId: number, userMessage: string, images: IncomingIm
             const answer =
                 finalText ||
                 lastText ||
-                'I ran out of steps before answering. Send /stop-free follow-up such as "continue" and I will pick the work back up.';
+                'I ran out of steps before answering. Reply "continue" and I will pick the work back up.';
             await remember(chatId, memoryText, answer);
             return answer;
         } finally {
@@ -1579,6 +1609,11 @@ async function askClaude(chatId: number, userMessage: string, images: IncomingIm
             tokenSource.dispose();
         }
     } catch (error) {
+        if (currentRun?.token.isCancellationRequested || (error instanceof Error && /cancel/i.test(error.name))) {
+            outputChannel.appendLine('/stop cancelled the turn.');
+            return '🛑 Stopped at your request. Everything I already did stays in the conversation memory.';
+        }
+
         if (error instanceof vscode.LanguageModelError) {
             outputChannel.appendLine(`Language Model error: ${error.message} (${error.code})`);
 

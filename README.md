@@ -43,10 +43,13 @@ Bridge your VS Code with Telegram - control your IDE from anywhere! Work with AI
 
 - **`/help`**: List every command (`/commands` also works)
 - **`/start`**: Get your chat ID and welcome message
-- **`/status`**: Show model, media backend and memory usage
+- **`/status`**: Show model, media backend, memory usage and agent budget
+- **`/stop`**: Cancel the reply that is running right now
 - **`/image <prompt>`**: Generate an image and send it here
 - **`/video <prompt>`**: Generate a short video and send it here
 - **`/model`**: List available language models; `/model <number>` switches to one
+- **`/files`**: List files remembered in the working set
+- **`/forget`**: Drop the remembered files, keep the conversation
 - **`/compact`**: Fold older messages into a summary right now
 - **`/clear`**: Clear the conversation history and its summary
 
@@ -119,6 +122,8 @@ All settings are available under `telecode` in VS Code settings:
 - **`modelId`**: Model used for replies (`/model` switches it)
 - **`memory.fileContextChars`**: Characters of remembered file content sent with each request
 - **`agent.autoTools`** (default `true`): Only offer coding tools when a message looks like a workspace request. Set to `false` to always offer them.
+- **`agent.maxSteps`** (default `200`): Tool steps allowed in one reply.
+- **`agent.maxTurnMinutes`** (default `45`): Wall-clock limit for one reply.
 
 ### Tool use
 
@@ -126,7 +131,9 @@ Tools are only offered when the message looks like actual workspace work — a f
 Confirmations stay in work mode: "yes", "ok", "go ahead" or "do it" get tools when a tool ran in the last 20 minutes or when the assistant's last message asked you to continue. If a direct answer turns out to need the workspace ("I need to read the file…"), TeleCode retries that same turn with tools enabled instead of stalling.
 
 Tool results are remembered too. The activity log keeps the tool name, its arguments and the first ~600 characters of output, so a later "where are we now?" can quote the last `git status` instead of re-running it.
-When tools are used, the loop is bounded: a repeated identical tool call is skipped with a nudge, and after 6 tool rounds TeleCode makes one final call **without** tools so you always get an answer instead of silence.
+When tools are used, the bot behaves like a coding agent: it plans, executes step by step, verifies its own changes and keeps going until the task is finished. One reply may use up to **200 steps** (`telecode.agent.maxSteps`) within **45 minutes** (`telecode.agent.maxTurnMinutes`); send `/stop` to cancel mid-run. It only returns early when it has a final answer.
+
+Long runs stay inside the context window: all but the 10 newest tool results are stubbed out every 5 steps, an identical tool call is blocked for 8 steps and answered with its earlier result, a failed request is retried once after aggressive pruning, and an empty model reply triggers one retry instead of silence.
 
 ## Features in Detail
 

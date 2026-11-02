@@ -2,7 +2,7 @@
 	"name": "telecode",
 	"displayName": "TeleCode",
 	"description": "Bridge VS Code and Telegram - control your IDE from anywhere",
-	"version": "0.1.16",
+	"version": "0.1.17",
 	"publisher": "local",
 	"license": "MIT",
 	"repository": {
@@ -96,6 +96,19 @@
 					"type": "boolean",
 					"default": true,
 					"markdownDescription": "Only offer coding tools when a message looks like a workspace request (a file path, command, code, or a work verb such as fix/build/run). Conversational messages like \"where are we now?\" are then answered directly instead of triggering file reads and shell commands. Set to `false` to always offer tools."
+				},
+				"telecode.agent.maxSteps": {
+					"type": "number",
+					"default": 200,
+					"minimum": 1,
+					"maximum": 500,
+					"markdownDescription": "Maximum tool steps in one reply. The bot keeps working until the task is finished or this budget is spent; it only stops early when it has a final answer. Raise it for big refactors, lower it to keep replies cheap."
+				},
+				"telecode.agent.maxTurnMinutes": {
+					"type": "number",
+					"default": 45,
+					"minimum": 1,
+					"markdownDescription": "Wall-clock limit for one reply, in minutes. When it expires the bot stops calling tools and summarises what it finished. Send `/stop` to cancel a running turn at any time."
 				},
 				"telecode.media.enabled": {
 					"type": "boolean",

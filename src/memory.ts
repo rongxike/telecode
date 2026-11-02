@@ -79,7 +79,7 @@ export class ConversationMemory {
     /** Total characters of remembered file content per chat. */
     static readonly MAX_FILES_CHARS = 240000;
     /** Tool calls kept in the activity log per chat. */
-    static readonly MAX_ACTIVITY = 25;
+    static readonly MAX_ACTIVITY = 250;
 
     private readonly messages = new Map<number, StoredMessage[]>();
     private readonly summaries = new Map<number, string>();
