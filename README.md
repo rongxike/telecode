@@ -123,7 +123,9 @@ All settings are available under `telecode` in VS Code settings:
 ### Tool use
 
 Tools are only offered when the message looks like actual workspace work — a file path, a command, a code fragment, or a verb such as _fix_, _build_, _run_ or _search_. Conversational turns ("where are we now?", "thanks", "what's next?") are answered straight from the conversation and the remembered working set, so a simple question no longer turns into `git status` + directory listings.
+Confirmations stay in work mode: "yes", "ok", "go ahead" or "do it" get tools when a tool ran in the last 20 minutes or when the assistant's last message asked you to continue. If a direct answer turns out to need the workspace ("I need to read the file…"), TeleCode retries that same turn with tools enabled instead of stalling.
 
+Tool results are remembered too. The activity log keeps the tool name, its arguments and the first ~600 characters of output, so a later "where are we now?" can quote the last `git status` instead of re-running it.
 When tools are used, the loop is bounded: a repeated identical tool call is skipped with a nudge, and after 6 tool rounds TeleCode makes one final call **without** tools so you always get an answer instead of silence.
 
 ## Features in Detail

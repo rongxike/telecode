@@ -34,6 +34,8 @@ export interface ToolActivity {
     detail: string;
     ok: boolean;
     at: number;
+    /** Short preview of what the tool returned, so later turns need not re-run it. */
+    result?: string;
 }
 
 /** Compact "5 min ago" style age used in prompts and in `/files`. */
@@ -279,10 +281,14 @@ export class ConversationMemory {
             .slice(-limit)
             .map((entry) => {
                 const status = entry.ok ? 'ok' : 'failed';
-                return `- ${entry.tool}(${entry.detail}) -> ${status}, ${formatAge(now - entry.at)}`;
+                const head = `- ${entry.tool}(${entry.detail}) -> ${status}, ${formatAge(now - entry.at)}`;
+                return entry.result ? `${head}\n  result: ${entry.result}` : head;
             });
 
-        return `Tool calls already made in this conversation (do not repeat them unless something changed):\n${lines.join('\n')}`;
+        return [
+            'Tools already run in this conversation, with the start of their output. Reuse these results instead of calling the same tool again:',
+            ...lines
+        ].join('\n');
     }
 
     /**

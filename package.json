@@ -2,7 +2,7 @@
 	"name": "telecode",
 	"displayName": "TeleCode",
 	"description": "Bridge VS Code and Telegram - control your IDE from anywhere",
-	"version": "0.1.15",
+	"version": "0.1.16",
 	"publisher": "local",
 	"license": "MIT",
 	"repository": {

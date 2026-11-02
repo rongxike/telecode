@@ -20,6 +20,9 @@ let memory: ConversationMemory;
 let activeTelegramChat: number | null = null; // Track active Telegram conversation
 let extensionContext: vscode.ExtensionContext;
 
+/** Cancellation handles for in-flight turns, so /stop can abort them. */
+const activeRuns = new Map<number, vscode.CancellationTokenSource>();
+
 // Extension API that can be called by other extensions or commands
 export interface TelegramAPI {
     sendToActiveTelegramChat(message: string): Promise<boolean>;
@@ -423,6 +426,18 @@ async function handleIncomingMessage(msg: Message) {
         return;
     }
 
+    if (command === '/stop') {
+        const run = activeRuns.get(chatId);
+        if (!run) {
+            await bot.sendMessage(chatId, 'Nothing is running right now.');
+            return;
+        }
+        run.cancel();
+        outputChannel.appendLine(`Cancelling the running turn for chat ${chatId}`);
+        await bot.sendMessage(chatId, '🛑 Stopping - I will keep whatever I already finished.');
+        return;
+    }
+
     if (command === '/files') {
         await handleFilesCommand(chatId);
         return;
@@ -454,6 +469,15 @@ async function handleIncomingMessage(msg: Message) {
     const enableAI = config.get<boolean>('enableAIIntegration');
 
     if (enableAI) {
+        // One turn at a time per chat: a long agent run must not be interleaved.
+        if (activeRuns.has(chatId)) {
+            await bot.sendMessage(
+                chatId,
+                '⏳ Still working on the previous message. Send /stop to cancel it, or wait for me to finish.'
+            );
+            return;
+        }
+
         // Set active chat context and persist it
         activeTelegramChat = chatId;
         await extensionContext.globalState.update('activeTelegramChat', chatId);
@@ -982,7 +1006,65 @@ const CHAT_ONLY_TOOL_PATTERN =
 const ungrantedTools = new Set<string>();
 
 const MAX_TOOL_COUNT = 16;
-const MAX_TOOL_ROUNDS = 6;
+
+/** Hard ceiling on a single turn; the real limit comes from `telecode.agent.maxSteps`. */
+const MAX_STEPS_CEILING = 500;
+const DEFAULT_MAX_STEPS = 200;
+const DEFAULT_MAX_TURN_MINUTES = 45;
+/** Newest tool results kept verbatim in the request; older ones are stubbed out. */
+const TOOL_KEEP_RESULTS = 10;
+/** An identical tool call is re-executed only after this many steps of progress. */
+const REPEAT_BLOCK_STEPS = 8;
+
+/** Step and time budget for one agent turn. */
+function agentLimits(): { steps: number; minutes: number } {
+    const config = vscode.workspace.getConfiguration('telecode');
+    const steps = config.get<number>('agent.maxSteps');
+    const minutes = config.get<number>('agent.maxTurnMinutes');
+
+    return {
+        steps:
+            typeof steps === 'number' && Number.isFinite(steps) && steps > 0
+                ? Math.min(Math.floor(steps), MAX_STEPS_CEILING)
+                : DEFAULT_MAX_STEPS,
+        minutes:
+            typeof minutes === 'number' && Number.isFinite(minutes) && minutes > 0
+                ? Math.floor(minutes)
+                : DEFAULT_MAX_TURN_MINUTES
+    };
+}
+
+/**
+ * Long agent runs accumulate tool output. Stub all but the newest results so a
+ * 200-step turn cannot exceed the model's context window; the activity log and
+ * the remembered file working set keep the important parts.
+ */
+function pruneOldToolResults(messages: vscode.LanguageModelChatMessage[], keepLast: number): void {
+    const parts: vscode.LanguageModelToolResultPart[] = [];
+
+    for (const message of messages) {
+        for (const part of message.content) {
+            if (part instanceof vscode.LanguageModelToolResultPart) {
+                parts.push(part);
+            }
+        }
+    }
+
+    for (const part of parts.slice(0, Math.max(0, parts.length - keepLast))) {
+        const alreadyPruned = part.content.some(
+            (item) => item instanceof vscode.LanguageModelTextPart && item.value.startsWith('[pruned]')
+        );
+        if (alreadyPruned) {
+            continue;
+        }
+
+        part.content = [
+            new vscode.LanguageModelTextPart(
+                '[pruned] This tool result was dropped to save context. Re-run the tool only if you still need the full output.'
+            )
+        ];
+    }
+}
 
 /**
  * Tools offered to the model: TeleCode's own tools first (always executable),
@@ -1041,6 +1123,17 @@ function describeToolCall(call: vscode.LanguageModelToolCallPart): string {
     return raw.replace(/\s+/g, ' ').slice(0, 90);
 }
 
+/** First part of a tool result, flattened to one line for the activity log. */
+function previewToolResult(content: readonly unknown[], limit = 600): string {
+    const text = content
+        .map((part) => (part instanceof vscode.LanguageModelTextPart ? part.value : ''))
+        .join(' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+    return text.length > limit ? `${text.slice(0, limit)} ...` : text;
+}
+
 /** Characters of remembered file content injected into each request. */
 function fileContextBudget(): number {
     const configured = vscode.workspace.getConfiguration('telecode').get<number>('memory.fileContextChars');
@@ -1058,25 +1151,72 @@ const WORK_REQUEST_PATTERN =
 const SMALLTALK_PATTERN =
     /^(hi|hey|hello|yo|sup|thanks|thank you|thx|ok|okay|k|cool|nice|great|got it|sure|yes|no|yep|nope|lol|haha|good (morning|night|evening)|how are you)\b/i;
 
+/** Short replies that continue the previous request instead of starting a new one. */
+const CONTINUATION_PATTERN =
+    /^(yes|yeah|yep|y|sure|ok|okay|k|go ahead|go on|do it|please do|please|continue|proceed|keep going|carry on|next|finish it|try again|again|sounds good|that works|perfect|great|correct|right)\b/i;
+
+/** The model admitting it needs the workspace even though no tools were offered. */
+const NEEDS_WORKSPACE_PATTERN =
+    /\b(i (need|have) to (check|read|look|inspect|open|run|see)|i don'?t have (access|the (file|content|code))|i can(?:'|no)t (see|read|access)|without (seeing|reading|access to) (the|your) (files?|code|repo)|let me (check|look at|read) the (file|repo|code))/i;
+
+/** How long a tool-using turn keeps the next short reply in work mode. */
+const TOOL_STICKY_MS = 20 * 60 * 1000;
+
+/** True when a tool ran in this chat recently enough that the work is still in flight. */
+function hadRecentToolActivity(chatId: number): boolean {
+    const activity = memory.getActivity(chatId);
+    const last = activity[activity.length - 1];
+    return last !== undefined && Date.now() - last.at < TOOL_STICKY_MS;
+}
+
+/** True when the assistant's last message asked the user to confirm or continue. */
+function assistantAskedToContinue(chatId: number): boolean {
+    const messages = memory.getMessages(chatId);
+
+    for (let index = messages.length - 1; index >= 0; index--) {
+        if (messages[index].role !== 'assistant') {
+            continue;
+        }
+
+        const text = messages[index].text.trim();
+        return (
+            /\?\s*$/.test(text) ||
+            /(shall i|should i|want me to|would you like|let me know|continue\?|proceed\?|go ahead\?)/i.test(text)
+        );
+    }
+
+    return false;
+}
+
 /**
- * Decide whether a message is worth offering tools for. Tool-happy models call
- * tools on "where are we now?" if they are available, so conversational
- * messages are answered directly from the conversation and working set.
+ * Decide whether to offer tools. Tool-happy models call tools on "where are we
+ * now?" when tools are available, so conversational messages are answered from
+ * the conversation and working set instead. Confirmations such as "yes" after a
+ * tool-using turn stay in work mode.
  */
-function looksLikeWorkRequest(text: string): boolean {
+function shouldOfferTools(text: string, chatId: number): boolean {
     const trimmed = text.trim();
 
     if (trimmed.length === 0) {
         return false;
     }
-    if (SMALLTALK_PATTERN.test(trimmed) && trimmed.length <= 40) {
-        return false;
-    }
-    // A path or a code fragment is an explicit request to look at files.
-    if (/`|(^|\s)[\w.-]+[\\/][\w.-]+/.test(trimmed)) {
+
+    // A path, a code fragment or a work verb is an explicit request.
+    if (/`|(^|\s)[\w.-]+[\\/][\w.-]+/.test(trimmed) || WORK_REQUEST_PATTERN.test(trimmed)) {
         return true;
     }
-    if (WORK_REQUEST_PATTERN.test(trimmed)) {
+
+    if (trimmed.length <= 40 && CONTINUATION_PATTERN.test(trimmed)) {
+        // "Yes" / "go ahead" only means work when work was already happening.
+        return hadRecentToolActivity(chatId) || assistantAskedToContinue(chatId);
+    }
+
+    if (trimmed.length <= 40 && SMALLTALK_PATTERN.test(trimmed)) {
+        return false;
+    }
+
+    // Follow-up questions in an active work thread usually need the files again.
+    if (hadRecentToolActivity(chatId) && trimmed.length <= 200 && /\?\s*$/.test(trimmed)) {
         return true;
     }
 
@@ -1094,6 +1234,10 @@ function buildWorkspaceContext(): string {
         'Use telecode_run_command for shell work such as git add/commit/push, npm and dotnet. Use telecode_list_dir to browse, telecode_read_file to inspect, telecode_search to grep, and telecode_write_file to create or overwrite files.',
         'Some files are already included in this request (see the working-set message). Use that content first and only call telecode_read_file for files that are missing or marked truncated.',
         'Match the effort to the request. Chat, status questions and anything the conversation or working set already answers get a direct reply with no tool calls - do not explore the repository just to orient yourself.',
+        'If the user replies with a short confirmation such as "yes", "ok" or "go ahead", continue the work you just proposed and do not ask again or claim you cannot act.',
+        'Work like an autonomous coding agent: think the problem through, state a short plan for anything larger than a single edit, then execute it step by step and verify each change by reading the file back or running a build/test instead of assuming it worked.',
+        'You may take many steps in one turn. Keep going until the task is actually finished; do not stop mid-task to ask permission for steps you already described, and only ask the user when you are blocked or need a decision only they can make.',
+        'If a command or test fails, diagnose it and change approach instead of repeating the same call.',
         'Only call tools when you need information you do not already have. Read a file at most once per turn and stop calling tools as soon as you can answer.',
         'The copilot_* tools, run_in_terminal, read_file, create_file, apply_patch and the subagent tools require the chat panel and always fail here - do not call them.',
         'If a tool call fails, try one alternative tool. If that fails too, stop and report the exact error instead of retrying the same call.',
@@ -1221,13 +1365,16 @@ async function askClaude(chatId: number, userMessage: string, images: IncomingIm
             : vscode.LanguageModelChatMessage.User(userMessage);
 
         const autoTools = vscode.workspace.getConfiguration('telecode').get<boolean>('agent.autoTools') ?? true;
-        const useTools = !autoTools || looksLikeWorkRequest(promptText);
-        const tools = useTools ? collectChatTools() : [];
+        let useTools = !autoTools || shouldOfferTools(promptText, chatId);
+        let tools = useTools ? collectChatTools() : [];
 
         outputChannel.appendLine(
             useTools
                 ? `Tools available: ${tools.length}${tools.length ? ` (${tools.slice(0, 8).map((t) => t.name).join(', ')}${tools.length > 8 ? ', ...' : ''})` : ''}`
-                : 'Conversational message: answering without tools.'
+                : 'Conversational message: answering without tools (will retry with tools if the model asks for the workspace).'
+        );
+        outputChannel.appendLine(
+            `Working set: ${workingSet.length} chars, ${memory.fileStats(chatId).count} remembered file(s), ${memory.getActivity(chatId).length} logged tool call(s).`
         );
 
         const messages: vscode.LanguageModelChatMessage[] = [
@@ -1240,12 +1387,26 @@ async function askClaude(chatId: number, userMessage: string, images: IncomingIm
             userMessageContent
         ];
 
+        const limits = agentLimits();
+        const deadline = Date.now() + limits.minutes * 60_000;
         const tokenSource = new vscode.CancellationTokenSource();
+        activeRuns.set(chatId, tokenSource);
         let lastText = '';
-        const seenCalls = new Map<string, number>();
+        const seenCalls = new Map<string, { preview: string; step: number }>();
 
         try {
-            for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+            for (let step = 0; step < limits.steps; step++) {
+                if (tokenSource.token.isCancellationRequested) {
+                    break;
+                }
+                if (Date.now() > deadline) {
+                    outputChannel.appendLine(`Turn time budget (${limits.minutes} min) reached after ${step} step(s).`);
+                    break;
+                }
+                if (step > 0 && step % 5 === 0) {
+                    pruneOldToolResults(messages, TOOL_KEEP_RESULTS);
+                }
+
                 const response = await model.sendRequest(
                     messages,
                     {
@@ -1277,6 +1438,23 @@ async function askClaude(chatId: number, userMessage: string, images: IncomingIm
                 );
 
                 if (toolCalls.length === 0) {
+                    // The model answered without tools. If it is asking for the workspace, give it tools and retry.
+                    if (!useTools && NEEDS_WORKSPACE_PATTERN.test(text)) {
+                        outputChannel.appendLine('Answer needed the workspace; retrying this turn with tools enabled.');
+                        useTools = true;
+                        tools = collectChatTools();
+                        messages.push(vscode.LanguageModelChatMessage.Assistant(parts));
+                        messages.push(
+                            vscode.LanguageModelChatMessage.User(
+                                'Tools are available now. Use them to get what you need, then answer the user.'
+                            )
+                        );
+                        if (bot) {
+                            await bot.sendChatAction(chatId, 'typing').catch(() => undefined);
+                        }
+                        continue;
+                    }
+
                     await remember(chatId, memoryText, text);
                     return text;
                 }
@@ -1289,16 +1467,16 @@ async function askClaude(chatId: number, userMessage: string, images: IncomingIm
                     outputChannel.appendLine(`Tool call: ${call.name} ${safeInput}`);
 
                     const signature = `${call.name}:${JSON.stringify(call.input ?? {})}`;
-                    const repeats = (seenCalls.get(signature) ?? 0) + 1;
-                    seenCalls.set(signature, repeats);
+                    const previous = seenCalls.get(signature);
 
-                    if (repeats > 1) {
-                        outputChannel.appendLine(`Skipping repeated call to ${call.name}`);
+                    // Block tight loops, but let the same call run again after real progress.
+                    if (previous !== undefined && step - previous.step < REPEAT_BLOCK_STEPS) {
+                        outputChannel.appendLine(`Skipping repeated call to ${call.name} at step ${step + 1}`);
                         messages.push(
                             vscode.LanguageModelChatMessage.User([
                                 new vscode.LanguageModelToolResultPart(call.callId, [
                                     new vscode.LanguageModelTextPart(
-                                        'You already made this exact call earlier in this turn and the result is above. Do not repeat it - answer the user with what you have.'
+                                        `You ran this exact call at step ${previous.step + 1}. Its result was: ${previous.preview}\nDo not repeat it - use that result and keep making progress on the task.`
                                     )
                                 ])
                             ])
@@ -1308,6 +1486,7 @@ async function askClaude(chatId: number, userMessage: string, images: IncomingIm
 
                     let resultPart: vscode.LanguageModelToolResultPart;
                     let succeeded = true;
+                    let preview = '';
                     try {
                         // TeleCode's own tools run in-process; everything else goes through VS Code.
                         const native = call.name.startsWith('telecode_')
@@ -1323,9 +1502,11 @@ async function askClaude(chatId: number, userMessage: string, images: IncomingIm
                             ));
 
                         resultPart = new vscode.LanguageModelToolResultPart(call.callId, result.content);
+                        preview = previewToolResult(result.content);
                     } catch (error) {
                         const message = error instanceof Error ? error.message : String(error);
                         succeeded = false;
+                        preview = `error: ${message}`;
                         outputChannel.appendLine(`Tool ${call.name} failed: ${message}`);
 
                         const chatOnly = /_inputContext|Invalid stream|Missing patch text|Invocation context|is not set|not available|not supported/i.test(message);
@@ -1345,10 +1526,13 @@ async function askClaude(chatId: number, userMessage: string, images: IncomingIm
 
                     messages.push(vscode.LanguageModelChatMessage.User([resultPart]));
 
+                    seenCalls.set(signature, { preview, step });
+
                     memory.recordTool(chatId, {
                         tool: call.name.replace(/^telecode_/, ''),
                         detail: describeToolCall(call),
-                        ok: succeeded
+                        ok: succeeded,
+                        result: preview
                     });
                 }
 
@@ -1357,8 +1541,15 @@ async function askClaude(chatId: number, userMessage: string, images: IncomingIm
                 }
             }
 
-            // Tool budget exhausted: ask once more with no tools so the user always gets an answer.
-            outputChannel.appendLine('Tool budget exhausted; requesting a final answer without tools.');
+            if (tokenSource.token.isCancellationRequested) {
+                outputChannel.appendLine('Turn cancelled by /stop.');
+                const partial = lastText || '🛑 Stopped at your request. Everything I did is in the conversation memory.';
+                await remember(chatId, memoryText, partial);
+                return partial;
+            }
+
+            // Step or time budget exhausted: ask once more with no tools so the user always gets an answer.
+            outputChannel.appendLine(`Turn budget exhausted after ${limits.steps} step(s); requesting a final answer without tools.`);
             const finalResponse = await model.sendRequest(
                 [
                     ...messages,
@@ -1380,10 +1571,11 @@ async function askClaude(chatId: number, userMessage: string, images: IncomingIm
             const answer =
                 finalText ||
                 lastText ||
-                'I used up my tool budget before answering. Ask again with a narrower question and I will finish.';
+                'I ran out of steps before answering. Send /stop-free follow-up such as "continue" and I will pick the work back up.';
             await remember(chatId, memoryText, answer);
             return answer;
         } finally {
+            activeRuns.delete(chatId);
             tokenSource.dispose();
         }
     } catch (error) {
