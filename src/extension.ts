@@ -1,10 +1,22 @@
 import * as vscode from 'vscode';
 import TelegramBot, { type Message } from 'node-telegram-bot-api';
+import { invokeTelecodeTool, registerTelecodeTools, telecodeTools } from './tools';
+import { ConversationMemory, type StoredMessage } from './memory';
+import {
+    generateImage,
+    generateVideo,
+    getMediaSettings,
+    initMedia,
+    promptForMediaApiKey,
+    setActiveChatProvider,
+    takeMedia,
+    type GeneratedMedia
+} from './media';
 
 let bot: TelegramBot | null = null;
 let activeToken: string | null = null; // Token the running bot was started with
 let outputChannel: vscode.OutputChannel;
-let conversationHistory = new Map<number, vscode.LanguageModelChatMessage[]>();
+let memory: ConversationMemory;
 let activeTelegramChat: number | null = null; // Track active Telegram conversation
 let extensionContext: vscode.ExtensionContext;
 
@@ -20,6 +32,11 @@ export function activate(context: vscode.ExtensionContext): TelegramAPI {
     extensionContext = context;
     outputChannel = vscode.window.createOutputChannel('TeleCode');
     context.subscriptions.push(outputChannel);
+
+    memory = new ConversationMemory(context);
+
+    // Tools the model can call while answering Telegram messages.
+    registerTelecodeTools(context);
 
     // Restore active chat from previous session
     activeTelegramChat = context.globalState.get<number>('activeTelegramChat') || null;
@@ -91,6 +108,15 @@ export function activate(context: vscode.ExtensionContext): TelegramAPI {
     context.subscriptions.push(
         vscode.commands.registerCommand('telecode.selectModel', pickChatModel)
     );
+
+    // Store the media provider key (Runware, ...) in Secret Storage
+    context.subscriptions.push(
+        vscode.commands.registerCommand('telecode.configureMediaKey', promptForMediaApiKey)
+    );
+
+    // Let media tools deliver generated images/videos to the active chat
+    initMedia(context);
+    setActiveChatProvider(() => activeTelegramChat);
 
     // Auto-start if configured
     const config = vscode.workspace.getConfiguration('telecode');
@@ -274,10 +300,10 @@ async function handleIncomingMessage(msg: Message) {
     outputChannel.appendLine(`Message from ${username} (${chatId}): ${text}`);
 
     // Handle /start command to show chat ID
-    if (text === '/start') {
+    if (text.trim().toLowerCase() === '/start') {
         await bot.sendMessage(
             chatId,
-            `Welcome to VS Code Telegram Bridge!\n\nYour Chat ID: ${chatId}\n\nAdd this ID to your VS Code settings under 'telecode.allowedChatIds' to enable communication.`
+            `Welcome to TeleCode!\n\nYour Chat ID: ${chatId}\n\nAdd this ID to your VS Code settings under 'telecode.allowedChatIds' to enable communication.\n\nSend /help to see everything I can do.`
         );
         return;
     }
@@ -292,18 +318,41 @@ async function handleIncomingMessage(msg: Message) {
     }
 
     // Handle special commands
-    if (text === '/clear') {
-        if (conversationHistory.has(chatId)) {
-            conversationHistory.delete(chatId);
-            await bot.sendMessage(chatId, '✅ Conversation history cleared!');
-            outputChannel.appendLine(`Cleared conversation for chat ${chatId}`);
-        } else {
+    const command = text.trim().toLowerCase();
+
+    if (command === '/help' || command === '/commands') {
+        await bot.sendMessage(chatId, HELP_TEXT);
+        return;
+    }
+
+    if (command === '/clear') {
+        const stats = memory.stats(chatId);
+        if (stats.messages === 0 && stats.summaryChars === 0) {
             await bot.sendMessage(chatId, 'No conversation history to clear.');
+        } else {
+            await memory.clear(chatId);
+            await bot.sendMessage(chatId, '✅ Conversation history and summary cleared!');
+            outputChannel.appendLine(`Cleared memory for chat ${chatId}`);
         }
         return;
     }
 
-    if (text === '/model' || text.startsWith('/model ')) {
+    if (command === '/compact') {
+        await handleCompactCommand(chatId);
+        return;
+    }
+
+    if (command === '/status') {
+        await handleStatusCommand(chatId);
+        return;
+    }
+
+    if (command === '/image' || command === '/video') {
+        await handleMediaCommand(chatId, text);
+        return;
+    }
+
+    if (command === '/model' || command.startsWith('/model ')) {
         await handleModelCommand(chatId, text);
         return;
     }
@@ -341,6 +390,9 @@ async function handleIncomingMessage(msg: Message) {
         } else {
             await bot.sendMessage(chatId, '❌ Failed to get response from Claude. Make sure Claude is available in VS Code.');
         }
+
+        // Send any images/videos produced by the telecode_generate_* tools.
+        await deliverGeneratedMedia(chatId);
     } else {
         // Show notification in VS Code for manual reply
         const action = await vscode.window.showInformationMessage(
@@ -400,9 +452,222 @@ async function sendMessage() {
 // No longer needed - using VS Code's built-in Language Model API
 
 function clearConversation() {
-    conversationHistory.clear();
-    vscode.window.showInformationMessage('Conversation history cleared!');
-    outputChannel.appendLine('Conversation history cleared');
+    void memory.clearAll().then(() => {
+        vscode.window.showInformationMessage('Conversation history cleared!');
+        outputChannel.appendLine('Conversation history and summaries cleared for all chats');
+    });
+}
+
+const HELP_TEXT = [
+    '🤖 TeleCode commands',
+    '',
+    '/help - show this list',
+    '/status - show model, media and memory info',
+    '/image <prompt> - generate an image and send it here',
+    '/video <prompt> - generate a short video and send it here',
+    '/model - list the language models VS Code offers',
+    '/model <number> - switch to that model',
+    '/compact - fold older messages into a summary now',
+    '/clear - forget the conversation and its summary',
+    '/start - show your chat ID',
+    '',
+    'Anything else goes to the selected model, which can read, search and edit this workspace and run commands.',
+    'Memory is kept per chat and survives VS Code restarts; it compacts automatically when it grows too large.'
+].join('\n');
+
+function toChatMessage(message: StoredMessage): vscode.LanguageModelChatMessage {
+    return message.role === 'user'
+        ? vscode.LanguageModelChatMessage.User(message.text)
+        : vscode.LanguageModelChatMessage.Assistant(message.text);
+}
+
+/** Persist a finished exchange and compact in the background if memory grows too large. */
+async function remember(chatId: number, userMessage: string, assistantMessage: string): Promise<void> {
+    await memory.append(
+        chatId,
+        { role: 'user', text: userMessage },
+        { role: 'assistant', text: assistantMessage }
+    );
+
+    void compactMemory(chatId, 'auto').catch((error) =>
+        outputChannel.appendLine(`Auto-compaction failed: ${error}`)
+    );
+}
+
+/** Summarise text with the selected model. Used only for compaction, never with tools. */
+async function summariseWithModel(prompt: string): Promise<string | null> {
+    const available = await vscode.lm.selectChatModels();
+    if (available.length === 0) {
+        return null;
+    }
+
+    const model = await pickPreferredModel(available);
+    if (!model) {
+        return null;
+    }
+
+    const tokenSource = new vscode.CancellationTokenSource();
+    try {
+        const response = await model.sendRequest(
+            [vscode.LanguageModelChatMessage.User(prompt)],
+            { justification: 'Compacting TeleCode conversation memory.' },
+            tokenSource.token
+        );
+
+        let text = '';
+        for await (const chunk of response.text) {
+            text += chunk;
+        }
+        return text.trim() || null;
+    } catch (error) {
+        outputChannel.appendLine(`Compaction model call failed: ${error}`);
+        return null;
+    } finally {
+        tokenSource.dispose();
+    }
+}
+
+const COMPACTION_CHUNK_CHARS = 48000;
+const SUMMARY_MAX_CHARS = 8000;
+
+function buildSummaryPrompt(chunk: string, previous: string): string {
+    return [
+        previous ? `Existing summary of this conversation:\n${previous}\n` : '',
+        'Conversation to fold into that summary:',
+        chunk,
+        '',
+        'Write an updated summary for a coding assistant that will continue this conversation later.',
+        'Keep goals, decisions, file paths, commands that were run, errors and open questions. Drop pleasantries.',
+        'Respond with the summary text only (max 400 words).'
+    ]
+        .filter(Boolean)
+        .join('\n');
+}
+
+/** Fold a long transcript into the summary chunk by chunk so nothing is silently dropped. */
+async function summariseTranscript(transcript: string, previous: string): Promise<string | null> {
+    let summary = previous;
+    let produced = false;
+
+    for (let offset = 0; offset < transcript.length; offset += COMPACTION_CHUNK_CHARS) {
+        const chunk = transcript.slice(offset, offset + COMPACTION_CHUNK_CHARS);
+        const result = await summariseWithModel(buildSummaryPrompt(chunk, summary));
+
+        if (!result) {
+            return produced ? summary : null;
+        }
+
+        summary = result.slice(0, SUMMARY_MAX_CHARS);
+        produced = true;
+    }
+
+    return produced ? summary : null;
+}
+
+interface CompactionResult {
+    before: { messages: number; chars: number; summaryChars: number };
+    after: { messages: number; chars: number; summaryChars: number };
+    summarised: boolean;
+}
+
+/**
+ * Fold older messages into the running summary. Automatic runs are no-ops while the
+ * memory is within limits; a manual `/compact` always runs.
+ */
+async function compactMemory(chatId: number, reason: 'auto' | 'manual'): Promise<CompactionResult | null> {
+    const before = memory.stats(chatId);
+    if (before.messages === 0) {
+        return null;
+    }
+    if (reason === 'auto' && !memory.needsCompaction(chatId)) {
+        return null;
+    }
+
+    const messages = memory.getMessages(chatId);
+    const keepCount = Math.min(ConversationMemory.KEEP_RECENT, Math.max(0, messages.length - 2));
+    const older = messages.slice(0, messages.length - keepCount);
+    const kept = messages.slice(messages.length - keepCount);
+
+    if (older.length === 0) {
+        return { before, after: before, summarised: false };
+    }
+
+    const previous = memory.getSummary(chatId);
+    const transcript = older
+        .map((message) => `${message.role === 'user' ? 'User' : 'Assistant'}: ${message.text}`)
+        .join('\n\n');
+
+    const summary = (await summariseTranscript(transcript, previous)) ?? previous;
+    const summarised = summary !== previous && summary.length > 0;
+
+    await memory.setCompacted(chatId, summary, kept);
+
+    const after = memory.stats(chatId);
+    outputChannel.appendLine(
+        `Compacted chat ${chatId} (${reason}): ${before.messages} msgs / ${before.chars} chars -> ${after.messages} msgs + ${after.summaryChars} char summary`
+    );
+    return { before, after, summarised };
+}
+
+/** Telegram `/status` command: backend, model and memory usage. */
+async function handleStatusCommand(chatId: number): Promise<void> {
+    if (!bot) {
+        return;
+    }
+
+    const stats = memory.stats(chatId);
+    const media = getMediaSettings();
+    const lines = ['📊 TeleCode status', ''];
+
+    lines.push(`Chat model: ${getConfiguredModelPreference() || '(first available VS Code model)'}`);
+
+    if (media) {
+        lines.push(`Media: enabled (${media.imageModel || 'no image model'} / ${media.videoModel || 'no video model'})`);
+        lines.push(`Media endpoint: ${media.baseUrl}`);
+    } else {
+        lines.push('Media: disabled (set telecode.media.enabled to generate images/videos)');
+    }
+
+    lines.push(`Memory: ${stats.messages} messages, ${stats.chars} chars, ${stats.summaryChars} char summary`);
+    lines.push(`Bot: ${bot ? 'running' : 'stopped'}`);
+
+    await bot.sendMessage(chatId, lines.join('\n'));
+}
+
+/** Telegram `/compact` command. */
+async function handleCompactCommand(chatId: number): Promise<void> {
+    if (!bot) {
+        return;
+    }
+
+    const stats = memory.stats(chatId);
+    if (stats.messages === 0 && stats.summaryChars === 0) {
+        await bot.sendMessage(chatId, 'Nothing to compact yet.');
+        return;
+    }
+
+    await bot.sendChatAction(chatId, 'typing').catch(() => undefined);
+    const result = await compactMemory(chatId, 'manual');
+
+    if (!result) {
+        await bot.sendMessage(chatId, 'Nothing to compact yet.');
+        return;
+    }
+
+    if (result.before.messages === result.after.messages && !result.summarised) {
+        await bot.sendMessage(
+            chatId,
+            `Memory is already compact: ${stats.messages} messages, ${stats.chars} chars, ${stats.summaryChars} char summary.`
+        );
+        return;
+    }
+
+    await bot.sendMessage(
+        chatId,
+        `🗜 Compacted ${result.before.messages} messages (${result.before.chars} chars) → ` +
+            `${result.after.messages} messages (${result.after.chars} chars) + ${result.after.summaryChars} char summary.` +
+            (result.summarised ? '' : '\n(Summary model was unavailable, so older turns were dropped without a summary.)')
+    );
 }
 
 /** Loose comparison so "DeepSeek V4 Flash" matches the id "deepseek-v4-flash". */
@@ -568,28 +833,15 @@ async function handleModelCommand(chatId: number, text: string): Promise<void> {
 const PREFERRED_TOOL_PATTERN =
     /file|folder|dir|search|text|grep|edit|replace|write|create|apply|patch|terminal|task|command|git|error|diagnostic|test|workspace/i;
 
-/** Concrete tool names to surface first when the provider publishes them. */
-const PREFERRED_TOOL_NAMES = [
-    'read_file',
-    'grep_search',
-    'file_search',
-    'list_dir',
-    'replace_string_in_file',
-    'create_file',
-    'run_in_terminal',
-    'terminal_last_command',
-    'get_terminal_output',
-    'run_task',
-    'get_errors'
-];
-
 /**
  * Tools that only work inside a Copilot chat request: they need the chat panel's
- * input context / tool invocation token, so invoking them over the Language Model
- * API throws "_inputContext is not set".
+ * stream / input context / tool invocation token, so invoking them over the Language
+ * Model API throws "Invalid stream", "_inputContext is not set" or
+ * "Invocation context must be provided". TeleCode ships and executes its own tool
+ * set instead (see tools.ts), and never offers these to the model.
  */
 const CHAT_ONLY_TOOL_PATTERN =
-    /subagent|^switch_agent$|^skill$|^tool_search$|^session_store|^resolve_memory_file_uri$|_view$/i;
+    /^(copilot_|run_in_terminal$|terminal_last_command$|get_terminal_output$|run_task$|read_file$|grep_search$|file_search$|list_dir$|replace_string_in_file$|create_file$|apply_?patch$|create_?file$|get_errors$|.*subagent.*$|switch_agent$|skill$|tool_search$|.*session_store.*$|resolve_memory_file_uri$|.*_view$)/i;
 
 /** Tools that failed at runtime because they cannot run outside the chat panel. */
 const ungrantedTools = new Set<string>();
@@ -597,39 +849,42 @@ const ungrantedTools = new Set<string>();
 const MAX_TOOL_COUNT = 48;
 const MAX_TOOL_ROUNDS = 10;
 
-/** Chat tools published by other extensions (Copilot, MCP servers, ...). */
+/**
+ * Tools offered to the model: TeleCode's own tools first (always executable),
+ * then other extensions' tools that are not chat-panel-only.
+ */
 function collectChatTools(): vscode.LanguageModelChatTool[] {
-    const all = (vscode.lm.tools ?? []).filter(
-        (tool) => !ungrantedTools.has(tool.name) && !CHAT_ONLY_TOOL_PATTERN.test(tool.name)
-    );
-
-    if (all.length === 0) {
-        return [];
-    }
-
-    const ranked: vscode.LanguageModelToolInformation[] = [];
-    const rest: vscode.LanguageModelToolInformation[] = [];
-
-    for (const name of PREFERRED_TOOL_NAMES) {
-        const match = all.find((tool) => tool.name === name);
-        if (match) {
-            ranked.push(match);
-        }
-    }
-
-    for (const tool of all) {
-        if (ranked.includes(tool)) {
-            continue;
-        }
-        const haystack = `${tool.name} ${tool.description ?? ''}`;
-        (PREFERRED_TOOL_PATTERN.test(haystack) ? ranked : rest).push(tool);
-    }
-
-    return [...ranked, ...rest].slice(0, MAX_TOOL_COUNT).map((tool) => ({
-        name: tool.name,
-        description: tool.description || tool.name,
-        inputSchema: tool.inputSchema as object | undefined
+    const own: vscode.LanguageModelChatTool[] = telecodeTools.map((definition) => ({
+        name: definition.name,
+        description: definition.description,
+        inputSchema: definition.inputSchema
     }));
+
+    const ownNames = new Set(own.map((tool) => tool.name));
+
+    const foreign = (vscode.lm.tools ?? [])
+        .filter(
+            (tool) =>
+                !ownNames.has(tool.name) &&
+                !ungrantedTools.has(tool.name) &&
+                !CHAT_ONLY_TOOL_PATTERN.test(tool.name)
+        )
+        .slice()
+        .sort(
+            (a, b) =>
+                Number(PREFERRED_TOOL_PATTERN.test(`${b.name} ${b.description ?? ''}`)) -
+                Number(PREFERRED_TOOL_PATTERN.test(`${a.name} ${a.description ?? ''}`))
+        );
+
+    const budget = Math.max(0, MAX_TOOL_COUNT - own.length);
+    return [
+        ...own,
+        ...foreign.slice(0, budget).map((tool) => ({
+            name: tool.name,
+            description: tool.description || tool.name,
+            inputSchema: tool.inputSchema as object | undefined
+        }))
+    ];
 }
 
 /** Tell the model it is running inside the workspace, so it uses tools instead of refusing. */
@@ -639,7 +894,8 @@ function buildWorkspaceContext(): string {
         'You are TeleCode, an AI coding assistant reached over Telegram but running inside the user\'s VS Code window.',
         'You DO have access to the workspace and its repository through the provided tools: use them to inspect files, search, run commands and make edits.',
         'Never claim you cannot see the files or the repository without first calling the available tools. Prefer doing the work over telling the user to run commands themselves.',
-        'Use run_in_terminal for shell work such as git add/commit/push. Do not call subagent, skill or switch_agent tools - they are unavailable in this context.',
+        'Use telecode_run_command for shell work such as git add/commit/push, npm and dotnet. Use telecode_list_dir to browse, telecode_read_file to inspect, telecode_search to grep, and telecode_write_file to create or overwrite files.',
+        'The copilot_* tools, run_in_terminal, read_file, create_file, apply_patch and the subagent tools require the chat panel and always fail here - do not call them.',
         'If a tool call fails, try one alternative tool. If that fails too, stop and report the exact error instead of retrying the same call.',
         'Keep replies short: they are delivered as Telegram messages.'
     ];
@@ -659,6 +915,67 @@ function buildWorkspaceContext(): string {
     return lines.join('\n');
 }
 
+/**
+ * Send any media generated while answering to the chat, falling back to a link.
+ */
+async function deliverGeneratedMedia(chatId: number): Promise<void> {
+    if (!bot) {
+        return;
+    }
+
+    for (const media of takeMedia(chatId)) {
+        try {
+            if (media.kind === 'image') {
+                await bot.sendPhoto(chatId, media.url, { caption: media.prompt.slice(0, 900) });
+            } else {
+                await bot.sendVideo(chatId, media.url, { caption: media.prompt.slice(0, 900) });
+            }
+        } catch (error) {
+            outputChannel.appendLine(`Failed to send generated ${media.kind}: ${error}`);
+            await bot.sendMessage(chatId, `Generated ${media.kind}: ${media.url}`);
+        }
+    }
+}
+
+/** Telegram `/image <prompt>` and `/video <prompt>` commands. */
+async function handleMediaCommand(chatId: number, text: string): Promise<void> {
+    if (!bot) {
+        return;
+    }
+
+    const [rawCommand, ...rest] = text.trim().split(/\s+/);
+    const kind = rawCommand.toLowerCase() === '/video' ? 'video' : 'image';
+    const prompt = rest.join(' ').trim();
+
+    if (!prompt) {
+        await bot.sendMessage(chatId, `Usage: /${kind} <prompt>`);
+        return;
+    }
+
+    if (!getMediaSettings()) {
+        await bot.sendMessage(
+            chatId,
+            'Media generation is disabled. Set "telecode.media.enabled": true and the model names in VS Code settings, then run "TeleCode: Configure Media API Key".'
+        );
+        return;
+    }
+
+    await bot.sendChatAction(chatId, kind === 'image' ? 'upload_photo' : 'upload_video').catch(() => undefined);
+
+    try {
+        const media: GeneratedMedia = kind === 'video' ? await generateVideo(prompt) : await generateImage(prompt);
+        if (kind === 'video') {
+            await bot.sendVideo(chatId, media.url, { caption: media.prompt.slice(0, 900) });
+        } else {
+            await bot.sendPhoto(chatId, media.url, { caption: media.prompt.slice(0, 900) });
+        }
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        outputChannel.appendLine(`Media generation failed: ${message}`);
+        await bot.sendMessage(chatId, `⚠️ Could not generate ${kind}: ${message}`);
+    }
+}
+
 async function askClaude(chatId: number, userMessage: string): Promise<string | null> {
     try {
         const available = await vscode.lm.selectChatModels();
@@ -676,11 +993,13 @@ async function askClaude(chatId: number, userMessage: string): Promise<string | 
 
         outputChannel.appendLine(`Using model: ${model.name || model.id} (${model.vendor}/${model.family})`);
 
-        if (!conversationHistory.has(chatId)) {
-            conversationHistory.set(chatId, []);
+        // Keep the transcript within limits before it is sent to the model.
+        if (memory.needsCompaction(chatId)) {
+            await compactMemory(chatId, 'auto');
         }
 
-        const history = conversationHistory.get(chatId)!;
+        const summary = memory.getSummary(chatId);
+        const stored = memory.getMessages(chatId);
         const userMsg = vscode.LanguageModelChatMessage.User(userMessage);
 
         const tools = collectChatTools();
@@ -688,7 +1007,10 @@ async function askClaude(chatId: number, userMessage: string): Promise<string | 
 
         const messages: vscode.LanguageModelChatMessage[] = [
             vscode.LanguageModelChatMessage.User(buildWorkspaceContext()),
-            ...history,
+            ...(summary
+                ? [vscode.LanguageModelChatMessage.User(`Summary of the earlier conversation:\n${summary}`)]
+                : []),
+            ...stored.map(toChatMessage),
             userMsg
         ];
 
@@ -728,10 +1050,7 @@ async function askClaude(chatId: number, userMessage: string): Promise<string | 
                 );
 
                 if (toolCalls.length === 0) {
-                    history.push(userMsg, vscode.LanguageModelChatMessage.Assistant(text));
-                    if (history.length > 20) {
-                        history.splice(0, history.length - 20);
-                    }
+                    await remember(chatId, userMessage, text);
                     return text;
                 }
 
@@ -744,24 +1063,32 @@ async function askClaude(chatId: number, userMessage: string): Promise<string | 
 
                     let resultPart: vscode.LanguageModelToolResultPart;
                     try {
-                        const result = await vscode.lm.invokeTool(
-                            call.name,
-                            { input: call.input, toolInvocationToken: undefined },
-                            tokenSource.token
-                        );
+                        // TeleCode's own tools run in-process; everything else goes through VS Code.
+                        const native = call.name.startsWith('telecode_')
+                            ? await invokeTelecodeTool(call.name, call.input)
+                            : undefined;
+
+                        const result =
+                            native ??
+                            (await vscode.lm.invokeTool(
+                                call.name,
+                                { input: call.input, toolInvocationToken: undefined },
+                                tokenSource.token
+                            ));
+
                         resultPart = new vscode.LanguageModelToolResultPart(call.callId, result.content);
                     } catch (error) {
                         const message = error instanceof Error ? error.message : String(error);
                         outputChannel.appendLine(`Tool ${call.name} failed: ${message}`);
 
-                        const chatOnly = /_inputContext|is not set|not available|not supported/i.test(message);
+                        const chatOnly = /_inputContext|Invalid stream|Missing patch text|Invocation context|is not set|not available|not supported/i.test(message);
                         if (chatOnly) {
                             ungrantedTools.add(call.name);
                             outputChannel.appendLine(`Disabling tool "${call.name}" for this session (chat-panel only).`);
                         }
 
                         const hint = chatOnly
-                            ? `Tool "${call.name}" cannot run outside the chat panel and has been disabled. Use run_in_terminal, read_file, grep_search or another available tool instead.`
+                            ? `Tool "${call.name}" cannot run outside the chat panel and has been disabled. Use telecode_read_file / telecode_write_file / telecode_list_dir / telecode_search / telecode_run_command instead.`
                             : `Tool "${call.name}" failed: ${message}. Try a different tool, or stop and report this error to the user.`;
 
                         resultPart = new vscode.LanguageModelToolResultPart(call.callId, [
@@ -781,12 +1108,9 @@ async function askClaude(chatId: number, userMessage: string): Promise<string | 
         }
 
         // Tool budget exhausted: keep whatever the model said last.
-        history.push(userMsg, vscode.LanguageModelChatMessage.Assistant(lastText));
-        if (history.length > 20) {
-            history.splice(0, history.length - 20);
-        }
-
-        return lastText || 'Stopped after too many tool calls without a final answer.';
+        const fallback = lastText || 'Stopped after too many tool calls without a final answer.';
+        await remember(chatId, userMessage, fallback);
+        return fallback;
     } catch (error) {
         if (error instanceof vscode.LanguageModelError) {
             outputChannel.appendLine(`Language Model error: ${error.message} (${error.code})`);

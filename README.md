@@ -41,8 +41,40 @@ Bridge your VS Code with Telegram - control your IDE from anywhere! Work with AI
 
 ### Telegram Bot Commands
 
+- **`/help`**: List every command (`/commands` also works)
 - **`/start`**: Get your chat ID and welcome message
-- **`/clear`**: Clear conversation history
+- **`/status`**: Show model, media backend and memory usage
+- **`/image <prompt>`**: Generate an image and send it here
+- **`/video <prompt>`**: Generate a short video and send it here
+- **`/model`**: List available language models; `/model <number>` switches to one
+- **`/compact`**: Fold older messages into a summary right now
+- **`/clear`**: Clear the conversation history and its summary
+
+### Media generation (Runware-compatible)
+
+The bot can generate images and videos through a media API such as [Runware](https://runware.ai):
+
+```json
+{
+  "telecode.media.enabled": true,
+  "telecode.media.baseUrl": "https://api.runware.ai/v1",
+  "telecode.media.imageModel": "runware:100@1",
+  "telecode.media.videoModel": "<your video model id>"
+}
+```
+
+Then run **TeleCode: Configure Media API Key** and paste the key. It is stored in VS Code's **Secret Storage** — never in `settings.json` and never in the repository.
+
+From Telegram:
+
+- `/image a watercolor fox reading a book` — generate and send an image
+- `/video a timelapse of clouds over a city` — generate and send a short video
+
+The model can also call `telecode_generate_image` and `telecode_generate_video` itself when you ask for a picture or clip in natural language; the generated file is delivered to the chat automatically.
+
+### Memory
+
+Conversation memory is stored per chat in VS Code's extension state, so it survives window reloads and restarts. When a chat grows past 400 messages or roughly 200k tokens of text, TeleCode summarises the older turns into a running summary (keeping the most recent 40 messages verbatim) and every request carries that summary as context. Long transcripts are folded in chunks so nothing is dropped. Use `/compact` to do it on demand and `/clear` to forget everything.
 
 ### From Telegram
 

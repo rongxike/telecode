@@ -2,7 +2,7 @@
 	"name": "telecode",
 	"displayName": "TeleCode",
 	"description": "Bridge VS Code and Telegram - control your IDE from anywhere",
-	"version": "0.1.5",
+	"version": "0.1.12",
 	"publisher": "local",
 	"license": "MIT",
 	"repository": {
@@ -10,7 +10,7 @@
 		"url": "https://github.com/rongxike/telecode.git"
 	},
 	"engines": {
-		"vscode": "^1.85.0"
+		"vscode": "^1.95.0"
 	},
 	"categories": [
 		"Other"
@@ -52,6 +52,10 @@
 			{
 				"command": "telecode.selectModel",
 				"title": "TeleCode: Select AI Model"
+			},
+			{
+				"command": "telecode.configureMediaKey",
+				"title": "TeleCode: Configure Media API Key"
 			}
 		],
 		"configuration": {
@@ -81,9 +85,239 @@
 					"type": "string",
 					"default": "",
 					"markdownDescription": "Language model used for Telegram replies. Accepts a model `id` (e.g. `deepseek-v4-flash`), a `vendor/family` pair (e.g. `deepseek/deepseek`), or a `family` name. Leave empty to use the first available model. Run **TeleCode: Select AI Model** to pick one."
+				},
+				"telecode.media.enabled": {
+					"type": "boolean",
+					"default": false,
+					"description": "Allow the bot to generate images and videos through a media API such as Runware."
+				},
+				"telecode.media.baseUrl": {
+					"type": "string",
+					"default": "https://api.runware.ai/v1",
+					"description": "Media generation endpoint. Runware expects the full v1 URL."
+				},
+				"telecode.media.imageModel": {
+					"type": "string",
+					"default": "runware:100@1",
+					"description": "Image model identifier used by /image and telecode_generate_image."
+				},
+				"telecode.media.videoModel": {
+					"type": "string",
+					"default": "",
+					"description": "Video model identifier used by /video and telecode_generate_video. Required for video generation."
 				}
 			}
-		}
+		},
+		"languageModelTools": [
+			{
+				"name": "telecode_read_file",
+				"displayName": "TeleCode: Read File",
+				"userDescription": "Read a file from the workspace.",
+				"modelDescription": "Read a text file from the workspace and return its contents with 1-based line numbers.",
+				"inputSchema": {
+					"type": "object",
+					"properties": {
+						"filePath": {
+							"type": "string",
+							"description": "Workspace-relative or absolute path inside the workspace."
+						},
+						"startLine": {
+							"type": "number",
+							"description": "First line to return (1-based)."
+						},
+						"endLine": {
+							"type": "number",
+							"description": "Last line to return (inclusive)."
+						}
+					},
+					"required": [
+						"filePath"
+					]
+				}
+			},
+			{
+				"name": "telecode_write_file",
+				"displayName": "TeleCode: Write File",
+				"userDescription": "Create or overwrite a file in the workspace.",
+				"modelDescription": "Create or overwrite a file in the workspace with the given content. Parent folders are created automatically.",
+				"inputSchema": {
+					"type": "object",
+					"properties": {
+						"filePath": {
+							"type": "string",
+							"description": "Workspace-relative or absolute path inside the workspace."
+						},
+						"content": {
+							"type": "string",
+							"description": "Full file content to write."
+						}
+					},
+					"required": [
+						"filePath",
+						"content"
+					]
+				}
+			},
+			{
+				"name": "telecode_list_dir",
+				"displayName": "TeleCode: List Directory",
+				"userDescription": "List the entries of a workspace directory.",
+				"modelDescription": "List files and folders inside a workspace directory. Defaults to the workspace root.",
+				"inputSchema": {
+					"type": "object",
+					"properties": {
+						"path": {
+							"type": "string",
+							"description": "Directory path, defaults to the workspace root."
+						}
+					}
+				}
+			},
+			{
+				"name": "telecode_search",
+				"displayName": "TeleCode: Search Files",
+				"userDescription": "Search file contents in the workspace.",
+				"modelDescription": "Search workspace file contents with a regular expression and return file:line matches.",
+				"inputSchema": {
+					"type": "object",
+					"properties": {
+						"query": {
+							"type": "string",
+							"description": "Regular expression to search for."
+						},
+						"glob": {
+							"type": "string",
+							"description": "Optional glob filter, e.g. \"**/*.ts\"."
+						},
+						"maxResults": {
+							"type": "number",
+							"description": "Maximum number of matches."
+						}
+					},
+					"required": [
+						"query"
+					]
+				}
+			},
+			{
+				"name": "telecode_edit_file",
+				"displayName": "TeleCode: Edit File",
+				"userDescription": "Replace an exact snippet in a file.",
+				"modelDescription": "Replace an exact snippet in a workspace file. Prefer this over rewriting a whole file. Fails when oldText is missing or ambiguous.",
+				"inputSchema": {
+					"type": "object",
+					"properties": {
+						"filePath": {
+							"type": "string",
+							"description": "Workspace-relative or absolute path inside the workspace."
+						},
+						"oldText": {
+							"type": "string",
+							"description": "Exact text to replace, copied from the file."
+						},
+						"newText": {
+							"type": "string",
+							"description": "Replacement text."
+						},
+						"replaceAll": {
+							"type": "boolean",
+							"description": "Replace every occurrence instead of requiring a unique match."
+						}
+					},
+					"required": [
+						"filePath",
+						"oldText",
+						"newText"
+					]
+				}
+			},
+			{
+				"name": "telecode_generate_image",
+				"displayName": "TeleCode: Generate Image",
+				"userDescription": "Generate an image and send it to the chat.",
+				"modelDescription": "Generate an image from a text prompt with the configured media API (e.g. Runware) and send it to the Telegram chat. Use when the user asks for a picture, logo, illustration or diagram image.",
+				"inputSchema": {
+					"type": "object",
+					"properties": {
+						"prompt": {
+							"type": "string",
+							"description": "Detailed description of the image to generate."
+						},
+						"width": {
+							"type": "number",
+							"description": "Width in pixels (default 1024)."
+						},
+						"height": {
+							"type": "number",
+							"description": "Height in pixels (default 1024)."
+						},
+						"model": {
+							"type": "string",
+							"description": "Optional model override."
+						}
+					},
+					"required": [
+						"prompt"
+					]
+				}
+			},
+			{
+				"name": "telecode_generate_video",
+				"displayName": "TeleCode: Generate Video",
+				"userDescription": "Generate a short video and send it to the chat.",
+				"modelDescription": "Generate a short video from a text prompt with the configured media API (e.g. Runware) and send it to the Telegram chat.",
+				"inputSchema": {
+					"type": "object",
+					"properties": {
+						"prompt": {
+							"type": "string",
+							"description": "Detailed description of the video to generate."
+						},
+						"durationSeconds": {
+							"type": "number",
+							"description": "Clip length in seconds (default 5)."
+						},
+						"width": {
+							"type": "number",
+							"description": "Width in pixels (default 1280)."
+						},
+						"height": {
+							"type": "number",
+							"description": "Height in pixels (default 720)."
+						},
+						"model": {
+							"type": "string",
+							"description": "Optional model override."
+						}
+					},
+					"required": [
+						"prompt"
+					]
+				}
+			},
+			{
+				"name": "telecode_run_command",
+				"displayName": "TeleCode: Run Command",
+				"userDescription": "Run a shell command in the workspace root.",
+				"modelDescription": "Run a shell command in the workspace root (PowerShell on Windows, bash elsewhere) and return stdout, stderr and the exit code. Use for git, build and test commands.",
+				"inputSchema": {
+					"type": "object",
+					"properties": {
+						"command": {
+							"type": "string",
+							"description": "The command line to execute."
+						},
+						"timeoutSeconds": {
+							"type": "number",
+							"description": "Timeout in seconds (1-600, default 120)."
+						}
+					},
+					"required": [
+						"command"
+					]
+				}
+			}
+		]
 	},
 	"scripts": {
 		"vscode:prepublish": "npm run compile",
