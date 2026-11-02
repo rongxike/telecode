@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import TelegramBot from 'node-telegram-bot-api';
+import TelegramBot, { type Message } from 'node-telegram-bot-api';
 
 let bot: TelegramBot | null = null;
 let outputChannel: vscode.OutputChannel;
@@ -178,7 +178,7 @@ function stopBot() {
     vscode.window.showInformationMessage('Telegram bot stopped.');
 }
 
-async function handleIncomingMessage(msg: TelegramBot.Message) {
+async function handleIncomingMessage(msg: Message) {
     if (!bot) return;
 
     const chatId = msg.chat.id;

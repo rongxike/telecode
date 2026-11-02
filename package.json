@@ -1,91 +1,99 @@
 {
-  "name": "telecode",
-  "displayName": "TeleCode",
-  "description": "Bridge VS Code and Telegram - control your IDE from anywhere",
-  "version": "0.1.0",
-  "engines": {
-    "vscode": "^1.85.0"
-  },
-  "categories": [
-    "Other"
-  ],
-  "activationEvents": [
-    "onStartupFinished"
-  ],
-  "main": "./out/extension.js",
-  "contributes": {
-    "commands": [
-      {
-        "command": "telecode.sendMessage",
-        "title": "TeleCode: Send Message"
-      },
-      {
-        "command": "telecode.configure",
-        "title": "TeleCode: Configure Bot Token"
-      },
-      {
-        "command": "telecode.startBot",
-        "title": "TeleCode: Start Bot"
-      },
-      {
-        "command": "telecode.stopBot",
-        "title": "TeleCode: Stop Bot"
-      },
-      {
-        "command": "telecode.clearConversation",
-        "title": "TeleCode: Clear Conversation History"
-      },
-      {
-        "command": "telecode.sendToActiveChat",
-        "title": "TeleCode: Send to Active Chat"
-      },
-      {
-        "command": "telecode.testSend",
-        "title": "TeleCode: Test Send"
-      }
-    ],
-    "configuration": {
-      "title": "TeleCode",
-      "properties": {
-        "telecode.botToken": {
-          "type": "string",
-          "default": "",
-          "description": "Telegram Bot API Token"
-        },
-        "telecode.allowedChatIds": {
-          "type": "array",
-          "default": [],
-          "description": "Allowed Telegram Chat IDs (for security)"
-        },
-        "telecode.autoStart": {
-          "type": "boolean",
-          "default": false,
-          "description": "Automatically start bot on VS Code startup"
-        },
-        "telecode.enableAIIntegration": {
-          "type": "boolean",
-          "default": true,
-          "description": "Enable automatic AI responses via VS Code Language Model API"
-        }
-      }
-    }
-  },
-  "scripts": {
-    "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./",
-    "lint": "eslint src --ext ts"
-  },
-  "devDependencies": {
-    "@types/node": "^20.x",
-    "@types/node-telegram-bot-api": "^0.64.12",
-    "@types/vscode": "^1.85.0",
-    "@typescript-eslint/eslint-plugin": "^6.x",
-    "@typescript-eslint/parser": "^6.x",
-    "eslint": "^8.x",
-    "typescript": "^5.3.0"
-  },
-  "dependencies": {
-    "node-telegram-bot-api": "^0.66.0"
-  }
+	"name": "telecode",
+	"displayName": "TeleCode",
+	"description": "Bridge VS Code and Telegram - control your IDE from anywhere",
+	"version": "0.1.0",
+	"publisher": "local",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/rongxike/telecode.git"
+	},
+	"engines": {
+		"vscode": "^1.85.0"
+	},
+	"categories": [
+		"Other"
+	],
+	"activationEvents": [
+		"onStartupFinished"
+	],
+	"main": "./out/extension.js",
+	"contributes": {
+		"commands": [
+			{
+				"command": "telecode.sendMessage",
+				"title": "TeleCode: Send Message"
+			},
+			{
+				"command": "telecode.configure",
+				"title": "TeleCode: Configure Bot Token"
+			},
+			{
+				"command": "telecode.startBot",
+				"title": "TeleCode: Start Bot"
+			},
+			{
+				"command": "telecode.stopBot",
+				"title": "TeleCode: Stop Bot"
+			},
+			{
+				"command": "telecode.clearConversation",
+				"title": "TeleCode: Clear Conversation History"
+			},
+			{
+				"command": "telecode.sendToActiveChat",
+				"title": "TeleCode: Send to Active Chat"
+			},
+			{
+				"command": "telecode.testSend",
+				"title": "TeleCode: Test Send"
+			}
+		],
+		"configuration": {
+			"title": "TeleCode",
+			"properties": {
+				"telecode.botToken": {
+					"type": "string",
+					"default": "",
+					"description": "Telegram Bot API Token"
+				},
+				"telecode.allowedChatIds": {
+					"type": "array",
+					"default": [],
+					"description": "Allowed Telegram Chat IDs (for security)"
+				},
+				"telecode.autoStart": {
+					"type": "boolean",
+					"default": false,
+					"description": "Automatically start bot on VS Code startup"
+				},
+				"telecode.enableAIIntegration": {
+					"type": "boolean",
+					"default": true,
+					"description": "Enable automatic AI responses via VS Code Language Model API"
+				}
+			}
+		}
+	},
+	"scripts": {
+		"vscode:prepublish": "npm run compile",
+		"compile": "tsc -p ./",
+		"watch": "tsc -watch -p ./",
+		"lint": "eslint src --ext ts"
+	},
+	"devDependencies": {
+		"@types/node": "^20.x",
+		"@types/vscode": "^1.85.0",
+		"@typescript-eslint/eslint-plugin": "^8.72.1",
+		"@typescript-eslint/parser": "^8.72.1",
+		"eslint": "^10.14.0",
+		"typescript": "^5.3.0"
+	},
+	"dependencies": {
+		"node-telegram-bot-api": "^1.2.0"
+	},
+	"overrides": {
+		"minimatch": "^11.0.4"
+	}
 }
