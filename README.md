@@ -56,10 +56,10 @@ The bot can generate images and videos through a media API such as [Runware](htt
 
 ```json
 {
-  "telecode.media.enabled": true,
-  "telecode.media.baseUrl": "https://api.runware.ai/v1",
-  "telecode.media.imageModel": "runware:100@1",
-  "telecode.media.videoModel": "<your video model id>"
+	"telecode.media.enabled": true,
+	"telecode.media.baseUrl": "https://api.runware.ai/v1",
+	"telecode.media.imageModel": "runware:100@1",
+	"telecode.media.videoModel": "<your video model id>"
 }
 ```
 
